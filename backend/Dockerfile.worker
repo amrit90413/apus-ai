@@ -1,0 +1,11 @@
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+COPY src/ ./
+RUN dotnet publish Analytics.Worker/Analytics.Worker.csproj -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/runtime:9.0 AS final
+WORKDIR /app
+RUN adduser --disabled-password --uid 10001 appuser
+COPY --from=build /app .
+USER appuser
+ENTRYPOINT ["dotnet", "Analytics.Worker.dll"]

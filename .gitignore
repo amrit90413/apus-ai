@@ -1,0 +1,14 @@
+# .NET
+bin/
+obj/
+*.user
+# Node
+node_modules/
+dist/
+.next/
+# Env / secrets
+.env
+*.local
+infra/k8s/secrets.yaml
+# OS
+.DS_Store

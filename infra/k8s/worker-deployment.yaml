@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-worker
+  namespace: ai-gateway
+spec:
+  replicas: 2                      # competing consumers on usage.analytics queue
+  selector:
+    matchLabels: { app: analytics-worker }
+  template:
+    metadata:
+      labels: { app: analytics-worker }
+    spec:
+      containers:
+        - name: analytics-worker
+          image: ghcr.io/yourcompany/analytics-worker:latest
+          envFrom:
+            - secretRef: { name: gateway-secrets }
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
