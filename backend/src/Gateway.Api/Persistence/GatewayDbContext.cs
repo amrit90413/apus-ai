@@ -24,6 +24,7 @@ public sealed class GatewayDbContext : DbContext
     public DbSet<Membership> Memberships => Set<Membership>();
     public DbSet<Session> Sessions => Set<Session>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<ProviderKey> ProviderKeys => Set<ProviderKey>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {

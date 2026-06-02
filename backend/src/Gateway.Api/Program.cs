@@ -3,6 +3,7 @@ using Gateway.Api.Gateway;
 using Gateway.Api.Messaging;
 using Gateway.Api.Persistence;
 using Gateway.Api.Providers;
+using Microsoft.Extensions.Caching.Memory;
 using Gateway.Api.Quota;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -68,6 +69,8 @@ builder.Services.AddAuthorization(o =>
     o.AddPolicy("OrgAdmin", p => p.RequireRole("OrgAdmin", "SuperAdmin"));
     o.AddPolicy("SuperAdmin", p => p.RequireRole("SuperAdmin"));
 });
+
+builder.Services.AddSingleton<IProviderKeyService, ProviderKeyService>();
 
 builder.Services.AddControllers();
 

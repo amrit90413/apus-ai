@@ -61,3 +61,14 @@ CREATE TABLE audit_logs (
     at              timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX ix_audit_org_at ON audit_logs(organization_id, at DESC);
+
+-- Platform-level AI provider keys managed by super admins via the dashboard.
+-- No organization_id: these are shared across the whole platform.
+CREATE TABLE provider_keys (
+    id              uuid PRIMARY KEY,
+    provider        text NOT NULL,        -- 'anthropic', 'openai'
+    encrypted_key   text NOT NULL,        -- AES-256-GCM encrypted, base64 encoded
+    key_hint        text NOT NULL,        -- last 4 chars shown in UI, e.g. "...6789"
+    is_active       boolean NOT NULL DEFAULT true,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);

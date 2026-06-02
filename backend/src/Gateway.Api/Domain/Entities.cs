@@ -67,6 +67,17 @@ public sealed class Session
     public bool IsActive => RevokedAt is null && ExpiresAt > DateTimeOffset.UtcNow;
 }
 
+/// <summary>Platform-level AI provider API keys. Managed by super admins via the dashboard.</summary>
+public sealed class ProviderKey
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string Provider { get; set; } = "";        // "anthropic", "openai"
+    public string EncryptedKey { get; set; } = "";    // AES-256-GCM, base64
+    public string KeyHint { get; set; } = "";          // "...6789" shown in UI
+    public bool IsActive { get; set; } = true;
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class AuditLog
 {
     public long Id { get; set; }

@@ -8,10 +8,27 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API}${path}`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  return res.json() as Promise<T>;
+}
+
+async function del(path: string): Promise<void> {
+  const res = await fetch(`${API}${path}`, { method: "DELETE", credentials: "include" });
+  if (!res.ok) throw new Error(`${res.status} ${path}`);
+}
+
 export interface OrgRow { id: string; name: string; seats: number; used: number; limit: number; status: "active" | "near" | "throttled"; }
 export interface ConsumerRow { userId: string; email: string; inputTokens: number; outputTokens: number; pctOfQuota: number; costUsd: number; }
 export interface Anomaly { id: string; userEmail: string; kind: string; detail: string; at: string; }
 export interface WindowState { name: string; used: number; limit: number; resetInSeconds: number; }
+export interface ProviderKeyRow { id: string; provider: string; keyHint: string; isActive: boolean; createdAt: string; }
 
 export const adminApi = {
   // Super-admin: cross-tenant rollup (ClickHouse-backed).
@@ -21,6 +38,11 @@ export const adminApi = {
   topConsumers: (workspaceId: string) => get<{ consumers: ConsumerRow[]; window: WindowState }>(`/v1/admin/workspaces/${workspaceId}/top-consumers`),
   // User: own usage.
   myUsage: () => get<{ windows: WindowState[] }>("/v1/me/usage"),
+  // Super-admin: provider API key management.
+  listProviderKeys: () => get<{ keys: ProviderKeyRow[] }>("/v1/admin/provider-keys"),
+  addProviderKey: (provider: string, apiKey: string) =>
+    post<{ id: string }>("/v1/admin/provider-keys", { provider, apiKey }),
+  removeProviderKey: (id: string) => del(`/v1/admin/provider-keys/${id}`),
 };
 
 export function fmt(n: number): string {

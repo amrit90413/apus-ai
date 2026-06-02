@@ -22,11 +22,13 @@ public sealed class AnthropicProvider : IAiProvider
 {
     private readonly HttpClient _http;
     private readonly AnthropicOptions _opt;
+    private readonly IProviderKeyService _keyService;
 
-    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt)
+    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt, IProviderKeyService keyService)
     {
         _http = http;
         _opt = opt.Value;
+        _keyService = keyService;
     }
 
     public string Name => "anthropic";
@@ -36,6 +38,9 @@ public sealed class AnthropicProvider : IAiProvider
         ChatRequest request,
         [EnumeratorCancellation] CancellationToken ct)
     {
+        // DB key takes priority over env var so admins can rotate without redeploying.
+        var apiKey = await _keyService.GetActiveKeyAsync("anthropic", ct) ?? _opt.ApiKey;
+
         var system = request.Messages.FirstOrDefault(m => m.Role == "system")?.Content;
         var body = new
         {
@@ -49,7 +54,7 @@ public sealed class AnthropicProvider : IAiProvider
         };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{_opt.BaseUrl}/v1/messages");
-        req.Headers.Add("x-api-key", _opt.ApiKey);
+        req.Headers.Add("x-api-key", apiKey);
         req.Headers.Add("anthropic-version", _opt.Version);
         req.Content = JsonContent.Create(body);
 

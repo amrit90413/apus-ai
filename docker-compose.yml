@@ -54,7 +54,7 @@ services:
       ConnectionStrings__Redis: "redis:6379"
       ConnectionStrings__RabbitMq: "amqp://gateway:${RABBITMQ_PASSWORD:-devpassword}@rabbitmq:5672"
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-change-me-min-32-bytes-long-secret-key}
-      Anthropic__ApiKey: ${ANTHROPIC_API_KEY:?set your single org API key here}
+      Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional — set via super-admin dashboard instead
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -78,7 +78,9 @@ services:
   nginx:
     image: nginx:1.27-alpine
     ports:
-      - "8080:80"
+      - "8080:80"       # local dev / unified entry
+      - "9001:9001"     # production backend API
+      - "9002:9002"     # production frontend
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on: [gateway-api, frontend]
