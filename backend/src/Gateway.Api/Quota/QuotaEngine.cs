@@ -47,7 +47,7 @@ public sealed class QuotaEngine
         long estimate,
         out List<(string name, QuotaWindow w)> order)
     {
-        order = new();
+        var ord = new List<(string name, QuotaWindow w)>();
         var keys = new List<RedisKey>();
         var argv = new List<RedisValue> { estimate };
 
@@ -58,12 +58,13 @@ public sealed class QuotaEngine
                 keys.Add(Key(scope, id, $"{scope}:{w.Name}"));
                 argv.Add(w.TokenLimit);
                 argv.Add(w.WindowSeconds);
-                order.Add(($"{scope}:{w.Name}", w));
+                ord.Add(($"{scope}:{w.Name}", w));
             }
         }
 
         Add("user", p.UserId, userWindows);
         Add("workspace", p.WorkspaceId, workspaceWindows);
+        order = ord;
         return (keys.ToArray(), argv.ToArray());
     }
 

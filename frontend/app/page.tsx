@@ -2,9 +2,12 @@ import Link from "next/link";
 
 export default function Home() {
   const links = [
-    { href: "/super-admin", label: "Super admin", desc: "Cross-tenant control plane" },
-    { href: "/admin", label: "Org admin", desc: "Per-employee tracking" },
+    { href: "/super-admin", label: "Super admin", desc: "Cross-tenant control plane & API keys" },
+    { href: "/admin/users", label: "Team members", desc: "Create users, track per-user usage" },
+    { href: "/admin/team", label: "Teams", desc: "Manage workspaces and team members" },
+    { href: "/admin", label: "Org dashboard", desc: "Workspace quota & top consumers" },
     { href: "/usage", label: "My usage", desc: "Your quota & reset countdown" },
+    { href: "/login", label: "Sign in", desc: "Login with WhatsApp OTP (admins)" },
   ];
   return (
     <div className="mx-auto max-w-2xl p-8">

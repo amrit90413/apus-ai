@@ -61,6 +61,7 @@ services:
       Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional — set via super-admin dashboard instead
       WhatsApp__BotUrl: ${WHATSAPP_BOT_URL:-http://host.docker.internal:3000}
       WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-sahil90413}
+      ConnectionStrings__ClickHouseHttp: "http://clickhouse:8123"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

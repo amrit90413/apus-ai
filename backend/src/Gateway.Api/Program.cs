@@ -1,3 +1,5 @@
+using Gateway.Api;
+using Gateway.Api.Admin;
 using Gateway.Api.Auth;
 using Gateway.Api.Gateway;
 using Gateway.Api.Messaging;
@@ -77,6 +79,11 @@ builder.Services.AddAuthorization(o =>
 });
 
 builder.Services.AddSingleton<IProviderKeyService, ProviderKeyService>();
+
+// ---- ClickHouse (admin usage analytics) ----
+builder.Services.AddHttpClient<ClickHouseClient>()
+    .ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(15));
+builder.Services.AddScoped<ClickHouseClient>();
 
 builder.Services.AddControllers();
 

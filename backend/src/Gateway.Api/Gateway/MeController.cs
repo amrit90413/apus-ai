@@ -42,7 +42,7 @@ public sealed class MeController : ControllerBase
         foreach (var w in policy.UserWindows)
         {
             var key = $"quota:user:{userId}:user:{w.Name}";
-            var used = (long)(await db.StringGetAsync(key)).GetValueOrDefault();
+            var used = (long?)(await db.StringGetAsync(key)) ?? 0;
             var ttl = await db.KeyTimeToLiveAsync(key);
             windows.Add(new { name = w.Name, used, limit = w.TokenLimit, resetInSeconds = (int)(ttl?.TotalSeconds ?? w.WindowSeconds) });
         }

@@ -76,6 +76,10 @@ export interface Anomaly { id: string; userEmail: string; kind: string; detail: 
 export interface WindowState { name: string; used: number; limit: number; resetInSeconds: number; }
 export interface ProviderKeyRow { id: string; provider: string; keyHint: string; isActive: boolean; createdAt: string; }
 
+export interface UserUsage { inputTokens: number; outputTokens: number; costUsd: number; requests: number; lastActive: string; }
+export interface UserRow { id: string; email: string; phoneNumber?: string; phoneVerified: boolean; isActive: boolean; createdAt: string; role: string; workspaceId?: string; usage?: UserUsage; }
+export interface WorkspaceRow { id: string; name: string; isActive: boolean; memberCount: number; }
+
 export const adminApi = {
   // Super-admin: cross-tenant rollup (ClickHouse-backed).
   organizations: () => get<{ orgs: OrgRow[]; totals: { orgs: number; employees: number; tokensToday: number; costToday: number } }>("/v1/admin/organizations"),
@@ -89,6 +93,28 @@ export const adminApi = {
   addProviderKey: (provider: string, apiKey: string) =>
     post<{ id: string }>("/v1/admin/provider-keys", { provider, apiKey }),
   removeProviderKey: (id: string) => del(`/v1/admin/provider-keys/${id}`),
+
+  // Org-admin: user management.
+  listUsers: () => get<{ users: UserRow[] }>("/v1/admin/users"),
+  createUser: (body: { email: string; password: string; phoneNumber?: string; workspaceId: string; role: string }) =>
+    post<{ userId: string; email: string }>("/v1/admin/users", body),
+  updateUser: (id: string, body: { isActive?: boolean; role?: string; phoneNumber?: string }) =>
+    post<{ updated: boolean }>(`/v1/admin/users/${id}`, body),
+  revokeUserSessions: (id: string) =>
+    post<{ sessionsRevoked: number }>(`/v1/admin/users/${id}/revoke-sessions`, {}),
+  getUserActivity: (id: string) =>
+    get<{ activity: unknown[] }>(`/v1/admin/users/${id}/activity`),
+
+  // Org-admin: workspace/team management.
+  listWorkspaces: () => get<{ workspaces: WorkspaceRow[] }>("/v1/admin/workspaces"),
+  createWorkspace: (name: string) =>
+    post<{ workspaceId: string }>("/v1/admin/workspaces", { name }),
+  getWorkspaceMembers: (id: string) =>
+    get<{ members: unknown[] }>(`/v1/admin/workspaces/${id}/members`),
+  addWorkspaceMember: (wsId: string, userId: string, role: string) =>
+    post<unknown>(`/v1/admin/workspaces/${wsId}/members`, { userId, role }),
+  removeWorkspaceMember: (wsId: string, userId: string) =>
+    del(`/v1/admin/workspaces/${wsId}/members/${userId}`),
 };
 
 export function fmt(n: number): string {
