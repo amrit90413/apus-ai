@@ -55,6 +55,12 @@ builder.Services.AddScoped<IQuotaPolicyResolver, QuotaPolicyResolver>();
 var rabbit = await RabbitMqUsagePublisher.CreateAsync(builder.Configuration.GetConnectionString("RabbitMq")!);
 builder.Services.AddSingleton<IUsageEventPublisher>(rabbit);
 
+// ---- Ollama (free local provider, no API key needed) ----
+var ollamaOpt = builder.Configuration.GetSection("Ollama").Get<OllamaOptions>() ?? new OllamaOptions();
+builder.Services.AddSingleton(ollamaOpt);
+builder.Services.AddHttpClient<OllamaProvider>(c => c.Timeout = TimeSpan.FromSeconds(120));
+builder.Services.AddTransient<IAiProvider, OllamaProvider>();
+
 // ---- AI providers with Polly resilience (retry + timeout + circuit breaker) ----
 var resilience = HttpPolicyExtensions
     .HandleTransientHttpError()
