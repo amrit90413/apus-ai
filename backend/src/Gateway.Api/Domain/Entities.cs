@@ -34,6 +34,8 @@ public sealed class User
     public Guid OrganizationId { get; set; }
     public string Email { get; set; } = "";
     public string PasswordHash { get; set; } = ""; // Argon2id
+    public string? PhoneNumber { get; set; }        // E.164 format e.g. "919876543210"
+    public bool PhoneVerified { get; set; } = false;
     public bool IsActive { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public List<Membership> Memberships { get; set; } = new();

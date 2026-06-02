@@ -21,6 +21,8 @@ CREATE TABLE users (
     organization_id uuid NOT NULL REFERENCES organizations(id),
     email           text NOT NULL,
     password_hash   text NOT NULL,
+    phone_number    text,
+    phone_verified  boolean NOT NULL DEFAULT false,
     is_active       boolean NOT NULL DEFAULT true,
     created_at      timestamptz NOT NULL DEFAULT now(),
     UNIQUE (organization_id, email)

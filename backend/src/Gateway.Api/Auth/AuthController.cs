@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using Gateway.Api.Auth;
 using Gateway.Api.Domain;
 using Gateway.Api.Persistence;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -9,7 +10,9 @@ namespace Gateway.Api.Auth;
 
 public sealed record LoginRequest(string Email, string Password, string DeviceName);
 public sealed record RefreshRequest(string RefreshToken);
+public sealed record VerifyOtpRequest(string PendingToken, string Otp);
 public sealed record TokenResponse(string AccessToken, string RefreshToken, DateTimeOffset AccessExpiresAt);
+public sealed record OtpPendingResponse(string Status, string PendingToken, string Message);
 
 [ApiController]
 [Route("api/v1/auth")]
@@ -18,18 +21,18 @@ public sealed class AuthController : ControllerBase
     private readonly GatewayDbContext _db;
     private readonly TokenService _tokens;
     private readonly JwtOptions _jwt;
+    private readonly OtpService _otp;
     private readonly ILogger<AuthController> _log;
 
-    public AuthController(GatewayDbContext db, TokenService tokens, JwtOptions jwt, ILogger<AuthController> log)
+    public AuthController(GatewayDbContext db, TokenService tokens, JwtOptions jwt,
+        OtpService otp, ILogger<AuthController> log)
     {
-        _db = db; _tokens = tokens; _jwt = jwt; _log = log;
+        _db = db; _tokens = tokens; _jwt = jwt; _otp = otp; _log = log;
     }
 
     [HttpPost("login")]
     public async Task<IActionResult> Login([FromBody] LoginRequest req, CancellationToken ct)
     {
-        // Login is cross-tenant by design (no org context yet), so query without the
-        // tenant filter via IgnoreQueryFilters. Password check is constant-time.
         var user = await _db.Users.IgnoreQueryFilters()
             .FirstOrDefaultAsync(u => u.Email == req.Email && u.IsActive, ct);
 
@@ -39,32 +42,48 @@ public sealed class AuthController : ControllerBase
             return Unauthorized(new { error = new { code = "invalid_credentials", message = "Email or password is incorrect." } });
         }
 
-        // Pick the user's default/first workspace membership.
         var membership = await _db.Memberships.IgnoreQueryFilters()
             .FirstOrDefaultAsync(m => m.UserId == user.Id, ct);
         if (membership is null)
             return Unauthorized(new { error = new { code = "no_workspace", message = "User has no workspace membership." } });
 
-        var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
-        var refresh = TokenService.GenerateRefreshToken();
-        var session = new Session
+        // Admin and SuperAdmin must verify via WhatsApp OTP before receiving a JWT.
+        if (membership.Role >= Role.OrgAdmin)
         {
-            OrganizationId = user.OrganizationId,
-            UserId = user.Id,
-            WorkspaceId = membership.WorkspaceId,
-            DeviceName = req.DeviceName,
-            DeviceFingerprint = Fingerprint(req.DeviceName, Request.Headers.UserAgent.ToString()),
-            RefreshTokenHash = TokenService.Hash(refresh),
-            LastIp = ip,                                   // anomaly detection only
-            ExpiresAt = DateTimeOffset.UtcNow.AddDays(_jwt.RefreshTokenDays)
-        };
-        _db.Sessions.Add(session);
-        await _db.SaveChangesAsync(ct);
+            if (string.IsNullOrWhiteSpace(user.PhoneNumber))
+                return UnprocessableEntity(new { error = new { code = "no_phone", message = "Admin account has no phone number. Contact your super admin." } });
 
-        var issued = _tokens.Issue(user, membership, session);
-        await Audit(user.OrganizationId, user.Id, "login", $"device={req.DeviceName} ip={ip}");
+            var pendingToken = await _otp.SendOtpAsync(user, ct);
+            await Audit(user.OrganizationId, user.Id, "otp_sent", $"device={req.DeviceName}");
 
-        return Ok(new TokenResponse(issued.AccessToken, refresh, issued.AccessExpiresAt));
+            return Accepted(new OtpPendingResponse(
+                Status: "otp_required",
+                PendingToken: pendingToken,
+                Message: $"OTP sent to WhatsApp number ending in {user.PhoneNumber[^4..]}"));
+        }
+
+        // Regular users and workspace admins get a JWT immediately.
+        return await IssueSession(user, membership, req.DeviceName);
+    }
+
+    [HttpPost("verify-otp")]
+    public async Task<IActionResult> VerifyOtp([FromBody] VerifyOtpRequest req, CancellationToken ct)
+    {
+        var userId = await _otp.VerifyOtpAsync(req.PendingToken, req.Otp);
+        if (userId == Guid.Empty)
+            return Unauthorized(new { error = new { code = "invalid_otp", message = "OTP is incorrect or has expired." } });
+
+        var user = await _db.Users.IgnoreQueryFilters().FirstOrDefaultAsync(u => u.Id == userId && u.IsActive, ct);
+        if (user is null)
+            return Unauthorized(new { error = new { code = "user_not_found", message = "User not found." } });
+
+        var membership = await _db.Memberships.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(m => m.UserId == user.Id, ct);
+        if (membership is null)
+            return Unauthorized(new { error = new { code = "no_workspace", message = "No workspace membership." } });
+
+        await Audit(user.OrganizationId, user.Id, "login_otp_verified", $"userId={userId}");
+        return await IssueSession(user, membership, "web");
     }
 
     [HttpPost("refresh")]
@@ -81,7 +100,6 @@ public sealed class AuthController : ControllerBase
         var membership = await _db.Memberships.IgnoreQueryFilters()
             .FirstAsync(m => m.UserId == user.Id && m.WorkspaceId == session.WorkspaceId, ct);
 
-        // Rotate the refresh token (detect token theft: an old token can't be reused).
         var newRefresh = TokenService.GenerateRefreshToken();
         session.RefreshTokenHash = TokenService.Hash(newRefresh);
         session.LastIp = HttpContext.Connection.RemoteIpAddress?.ToString();
@@ -103,6 +121,30 @@ public sealed class AuthController : ControllerBase
             await _db.SaveChangesAsync(ct);
         }
         return NoContent();
+    }
+
+    private async Task<IActionResult> IssueSession(User user, Membership membership, string deviceName)
+    {
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var refresh = TokenService.GenerateRefreshToken();
+        var session = new Session
+        {
+            OrganizationId = user.OrganizationId,
+            UserId = user.Id,
+            WorkspaceId = membership.WorkspaceId,
+            DeviceName = deviceName,
+            DeviceFingerprint = Fingerprint(deviceName, Request.Headers.UserAgent.ToString()),
+            RefreshTokenHash = TokenService.Hash(refresh),
+            LastIp = ip,
+            ExpiresAt = DateTimeOffset.UtcNow.AddDays(_jwt.RefreshTokenDays)
+        };
+        _db.Sessions.Add(session);
+        await _db.SaveChangesAsync();
+
+        var issued = _tokens.Issue(user, membership, session);
+        await Audit(user.OrganizationId, user.Id, "login", $"device={deviceName} ip={ip}");
+
+        return Ok(new TokenResponse(issued.AccessToken, refresh, issued.AccessExpiresAt));
     }
 
     private static string Fingerprint(string device, string ua)

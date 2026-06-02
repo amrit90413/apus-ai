@@ -2,8 +2,17 @@
 // the same JWT the CLI uses (stored in an httpOnly cookie set by the web login).
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "/api";
 
+function authHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const token = localStorage.getItem("access_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, { credentials: "include" });
+  const res = await fetch(`${API}${path}`, {
+    credentials: "include",
+    headers: authHeaders(),
+  });
   if (!res.ok) throw new Error(`${res.status} ${path}`);
   return res.json() as Promise<T>;
 }
@@ -12,7 +21,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`${res.status} ${path}`);
@@ -20,9 +29,46 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function del(path: string): Promise<void> {
-  const res = await fetch(`${API}${path}`, { method: "DELETE", credentials: "include" });
+  const res = await fetch(`${API}${path}`, {
+    method: "DELETE",
+    credentials: "include",
+    headers: authHeaders(),
+  });
   if (!res.ok) throw new Error(`${res.status} ${path}`);
 }
+
+export interface LoginResult { accessToken: string; refreshToken: string; accessExpiresAt: string; status?: never; }
+export interface OtpPendingResult { status: "otp_required"; pendingToken: string; message: string; }
+
+export const authApi = {
+  login: async (email: string, password: string): Promise<LoginResult | OtpPendingResult> => {
+    const res = await fetch(`${API}/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, deviceName: "web" }),
+    });
+    if (res.status === 202) return res.json() as Promise<OtpPendingResult>;
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json() as Promise<LoginResult>;
+  },
+  verifyOtp: async (pendingToken: string, otp: string): Promise<LoginResult> => {
+    const res = await fetch(`${API}/v1/auth/verify-otp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pendingToken, otp }),
+    });
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json() as Promise<LoginResult>;
+  },
+  saveToken: (accessToken: string, refreshToken: string) => {
+    localStorage.setItem("access_token", accessToken);
+    localStorage.setItem("refresh_token", refreshToken);
+  },
+  clearToken: () => {
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+  },
+};
 
 export interface OrgRow { id: string; name: string; seats: number; used: number; limit: number; status: "active" | "near" | "throttled"; }
 export interface ConsumerRow { userId: string; email: string; inputTokens: number; outputTokens: number; pctOfQuota: number; costUsd: number; }

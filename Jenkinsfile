@@ -1,20 +1,15 @@
-/*
-  Unified deploy pipeline for the YourCompany AI Gateway stack.
-
-  Brings up all docker-compose services — postgres, redis, rabbitmq, clickhouse,
-  gateway-api, analytics-worker, frontend, nginx — using docker-compose's layer
-  cache, so unchanged services are skipped and only changed ones are rebuilt.
-
-  To wire up the Jenkins job:
-    New Item → Pipeline → name "Apus-AI"
-    General  → Discard old builds → keep 30
-    Build Triggers → GitHub hook trigger for GITScm polling
-    Pipeline → Definition: Pipeline script from SCM
-             → SCM: Git, URL: https://github.com/amrit90413/apus-ai.git
-             → Branch: */main
-             → Script Path: Jenkinsfile
-    Save
-*/
+// Unified deploy pipeline for the YourCompany AI Gateway stack.
+// Services: postgres, redis, rabbitmq, clickhouse, gateway-api,
+//           analytics-worker, frontend, nginx
+//
+// Jenkins job setup:
+//   New Item > Pipeline > name "Apus-AI"
+//   General  > Discard old builds > keep 30
+//   Build Triggers > GitHub hook trigger for GITScm polling
+//   Pipeline > Pipeline script from SCM
+//            > Git: https://github.com/amrit90413/apus-ai.git
+//            > Branch: main   Script Path: Jenkinsfile
+//   Save
 
 pipeline {
     agent any

@@ -51,12 +51,16 @@ services:
 
   gateway-api:
     build: { context: ./backend, dockerfile: Dockerfile }
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets gateway reach WhatsApp bot on host ports 3000-3003
     environment:
       ConnectionStrings__Postgres: "Host=postgres;Database=gateway;Username=gateway;Password=${POSTGRES_PASSWORD:-devpassword}"
       ConnectionStrings__Redis: "redis:6379"
       ConnectionStrings__RabbitMq: "amqp://gateway:${RABBITMQ_PASSWORD:-devpassword}@rabbitmq:5672"
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-change-me-min-32-bytes-long-secret-key}
       Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional — set via super-admin dashboard instead
+      WhatsApp__BotUrl: ${WHATSAPP_BOT_URL:-http://host.docker.internal:3000}
+      WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-sahil90413}
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

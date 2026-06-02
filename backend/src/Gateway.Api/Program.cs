@@ -3,7 +3,6 @@ using Gateway.Api.Gateway;
 using Gateway.Api.Messaging;
 using Gateway.Api.Persistence;
 using Gateway.Api.Providers;
-using Microsoft.Extensions.Caching.Memory;
 using Gateway.Api.Quota;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -30,6 +29,13 @@ builder.Services.Configure<AnthropicOptions>(builder.Configuration.GetSection("A
 var jwtOpt = builder.Configuration.GetSection("Jwt").Get<JwtOptions>()!;
 builder.Services.AddSingleton(jwtOpt);
 builder.Services.AddSingleton<TokenService>();
+
+// ---- WhatsApp OTP ----
+var waOpt = builder.Configuration.GetSection("WhatsApp").Get<WhatsAppOptions>() ?? new WhatsAppOptions();
+builder.Services.AddSingleton(waOpt);
+builder.Services.AddHttpClient<WhatsAppGatewayClient>()
+    .ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddScoped<OtpService>();
 
 // ---- Postgres + tenant scope ----
 builder.Services.AddScoped<ITenantContext, TenantContext>();
