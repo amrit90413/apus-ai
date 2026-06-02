@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: gateway
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+    ports:
+      - "5436:5432"     # external access; 5432/5433/5435 taken by other projects
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./infra/db/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -78,9 +80,9 @@ services:
   nginx:
     image: nginx:1.27-alpine
     ports:
-      - "8080:80"       # local dev / unified entry
       - "9001:9001"     # production backend API
       - "9002:9002"     # production frontend
+      # NOTE: 8080 is reserved by Jenkins on the host — do not bind it here
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on: [gateway-api, frontend]
