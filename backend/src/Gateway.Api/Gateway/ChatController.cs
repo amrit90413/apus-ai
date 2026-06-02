@@ -161,6 +161,10 @@ public static class CostTable
         ["claude-opus-4-7"]   = (15m, 75m),
         ["claude-sonnet-4-6"] = (3m, 15m),
         ["gpt-4o"]            = (2.5m, 10m),
+        // Ollama — free local models
+        ["llama3.2"]          = (0m, 0m),
+        ["mistral"]           = (0m, 0m),
+        ["gemma2"]            = (0m, 0m),
     };
 
     public static decimal Estimate(string model, TokenUsage? usage)

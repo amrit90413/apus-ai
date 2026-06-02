@@ -62,6 +62,7 @@ services:
       WhatsApp__BotUrl: ${WHATSAPP_BOT_URL:-http://host.docker.internal:3000}
       WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-sahil90413}
       ConnectionStrings__ClickHouseHttp: "http://clickhouse:8123"
+      Ollama__BaseUrl: "http://host.docker.internal:11434"
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
