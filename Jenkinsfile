@@ -69,9 +69,9 @@ pipeline {
                             sleep 5
                         done
 
-                        # Check Frontend
+                        # 3) Wait for Frontend to respond (up to 90s)
                         for i in $(seq 1 18); do
-                            if curl -fsS --max-time 3 -o /dev/null http://localhost:9002/; then
+                            if docker compose exec -T nginx wget -qO- http://frontend:3000 > /dev/null 2>&1; then
                                 echo "✅ Frontend is ready"
                                 break
                             fi
