@@ -119,6 +119,15 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const res = await request<T>(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json() as Promise<T>;
+}
+
 async function del(path: string): Promise<void> {
   await request<void>(path, { method: "DELETE" });
 }
@@ -197,7 +206,7 @@ export const adminApi = {
   createUser: (body: { email: string; password: string; phoneNumber?: string; workspaceId: string; role: string }) =>
     post<{ userId: string; email: string }>("/v1/admin/users", body),
   updateUser: (id: string, body: { isActive?: boolean; role?: string; phoneNumber?: string }) =>
-    post<{ updated: boolean }>(`/v1/admin/users/${id}`, body),
+    patch<{ updated: boolean }>(`/v1/admin/users/${id}`, body),
   revokeUserSessions: (id: string) =>
     post<{ sessionsRevoked: number }>(`/v1/admin/users/${id}/revoke-sessions`, {}),
   getUserActivity: (id: string) =>
