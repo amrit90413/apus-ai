@@ -1,40 +1,126 @@
 // Thin typed client for the gateway admin API. The dashboard authenticates with
-// the same JWT the CLI uses (stored in an httpOnly cookie set by the web login).
+// the same JWT the CLI uses, held in localStorage and refreshed transparently.
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "/api";
 
-function authHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  const token = localStorage.getItem("access_token");
-  return token ? { Authorization: `Bearer ${token}` } : {};
+const ACCESS_KEY = "access_token";
+const REFRESH_KEY = "refresh_token";
+const EXPIRES_KEY = "access_expires_at";
+
+// Refresh this far ahead of expiry so an in-flight request can't straddle it.
+const REFRESH_SKEW_MS = 60_000;
+
+export class SessionExpiredError extends Error {
+  constructor() { super("Session expired"); this.name = "SessionExpiredError"; }
+}
+
+function store(tokens: LoginResult): void {
+  localStorage.setItem(ACCESS_KEY, tokens.accessToken);
+  localStorage.setItem(REFRESH_KEY, tokens.refreshToken);
+  localStorage.setItem(EXPIRES_KEY, tokens.accessExpiresAt);
+}
+
+function endSession(): SessionExpiredError {
+  localStorage.removeItem(ACCESS_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(EXPIRES_KEY);
+  // usePolling swallows rejections, so without this the dashboard would sit on
+  // stale data instead of showing the user they have been signed out.
+  if (typeof window !== "undefined" && window.location.pathname !== "/login")
+    window.location.assign("/login");
+  return new SessionExpiredError();
+}
+
+// The gateway rotates the refresh token on every use, so two concurrent refreshes
+// would leave the second holding a hash the server has already replaced. Every
+// caller therefore shares one in-flight request.
+let refreshInFlight: Promise<string> | null = null;
+
+function refreshAccessToken(): Promise<string> {
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    const refreshToken = localStorage.getItem(REFRESH_KEY);
+    if (!refreshToken) throw endSession();
+
+    let res: Response;
+    try {
+      res = await fetch(`${API}/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken }),
+      });
+    } catch {
+      // Network blip: keep the session and let the caller retry on the next poll.
+      throw new Error("Could not reach the gateway to refresh the session.");
+    }
+
+    if (!res.ok) throw endSession();
+
+    const tokens = (await res.json()) as LoginResult;
+    store(tokens);
+    return tokens.accessToken;
+  })();
+
+  return refreshInFlight.finally(() => { refreshInFlight = null; });
+}
+
+/** Returns a usable access token, refreshing when it is within the skew of expiry. */
+export async function getValidAccessToken(force = false): Promise<string | null> {
+  if (typeof window === "undefined") return null;
+
+  const token = localStorage.getItem(ACCESS_KEY);
+  if (!token) return null;
+  if (force) return refreshAccessToken();
+
+  const expiresAt = localStorage.getItem(EXPIRES_KEY);
+  // A session stored before expiry tracking existed: refresh once to learn it.
+  if (!expiresAt) return refreshAccessToken();
+
+  const msLeft = new Date(expiresAt).getTime() - Date.now();
+  if (Number.isNaN(msLeft)) return refreshAccessToken();
+
+  return msLeft > REFRESH_SKEW_MS ? token : refreshAccessToken();
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<Response> {
+  const send = async (token: string | null) =>
+    fetch(`${API}${path}`, {
+      ...init,
+      credentials: "include",
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+
+  let res = await send(await getValidAccessToken());
+
+  // Still rejected with a token we believed was valid — the session may have been
+  // revoked, or the gateway restarted. Force one refresh and retry exactly once.
+  if (res.status === 401 && localStorage.getItem(ACCESS_KEY)) {
+    res = await send(await getValidAccessToken(true));
+  }
+
+  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  return res;
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    credentials: "include",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  const res = await request<T>(path);
   return res.json() as Promise<T>;
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
+  const res = await request<T>(path, {
     method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
   return res.json() as Promise<T>;
 }
 
 async function del(path: string): Promise<void> {
-  const res = await fetch(`${API}${path}`, {
-    method: "DELETE",
-    credentials: "include",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  await request<void>(path, { method: "DELETE" });
 }
 
 export interface LoginResult { accessToken: string; refreshToken: string; accessExpiresAt: string; status?: never; }
@@ -60,13 +146,25 @@ export const authApi = {
     if (!res.ok) throw new Error(`${res.status}`);
     return res.json() as Promise<LoginResult>;
   },
-  saveToken: (accessToken: string, refreshToken: string) => {
-    localStorage.setItem("access_token", accessToken);
-    localStorage.setItem("refresh_token", refreshToken);
+  saveToken: (tokens: LoginResult) => store(tokens),
+  logout: async () => {
+    const refreshToken = localStorage.getItem(REFRESH_KEY);
+    if (refreshToken) {
+      // Best effort: revoke server-side so the refresh token dies with the session.
+      try {
+        await fetch(`${API}/v1/auth/logout`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refreshToken }),
+        });
+      } catch { /* revoke on the server is best effort; clear locally regardless */ }
+    }
+    endSession();
   },
   clearToken: () => {
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
+    localStorage.removeItem(ACCESS_KEY);
+    localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(EXPIRES_KEY);
   },
 };
 

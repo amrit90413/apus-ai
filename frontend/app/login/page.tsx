@@ -29,7 +29,7 @@ export default function LoginPage() {
         setStep("otp");
       } else {
         // Regular user — JWT returned directly
-        authApi.saveToken(result.accessToken, result.refreshToken);
+        authApi.saveToken(result);
         router.push("/");
       }
     } catch {
@@ -45,7 +45,7 @@ export default function LoginPage() {
     setError(null);
     try {
       const result = await authApi.verifyOtp(pendingToken, otp);
-      authApi.saveToken(result.accessToken, result.refreshToken);
+      authApi.saveToken(result);
       router.push("/");
     } catch {
       setError("Incorrect or expired OTP. Try again.");
