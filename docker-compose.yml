@@ -59,8 +59,14 @@ services:
       ConnectionStrings__RabbitMq: "amqp://gateway:${RABBITMQ_PASSWORD:-devpassword}@rabbitmq:5672"
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-change-me-min-32-bytes-long-secret-key}
       Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional — set via super-admin dashboard instead
+      WhatsApp__Enabled: ${WHATSAPP_ENABLED:-true}
       WhatsApp__BotUrl: ${WHATSAPP_BOT_URL:-http://host.docker.internal:3000}
-      WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-sahil90413}
+      WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-}
+      Bootstrap__AdminEmail: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      Bootstrap__AdminPassword: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      Bootstrap__AdminPhoneNumber: ${BOOTSTRAP_ADMIN_PHONE:-}
+      Bootstrap__OrganizationName: ${BOOTSTRAP_ORG_NAME:-YourCompany}
+      Bootstrap__OrganizationSlug: ${BOOTSTRAP_ORG_SLUG:-yourcompany}
       ConnectionStrings__ClickHouseHttp: "http://clickhouse:8123"
       Ollama__BaseUrl: "http://host.docker.internal:11434"
     depends_on:

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Gateway.Api.Quota;
 
 public enum WindowKind
@@ -18,6 +20,7 @@ public sealed record QuotaWindow(
     int WindowMinutes,    // 300, 1440, 10080, 43200...
     WindowKind Kind = WindowKind.Rolling)
 {
+    [JsonIgnore]
     public int WindowSeconds => WindowMinutes * 60;
 
     public static QuotaWindow Every(int minutes, long tokenLimit, string name) =>

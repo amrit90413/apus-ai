@@ -6,104 +6,60 @@ single request.
 
 ---
 
-## 0. Preflight blockers
+## 0. Before you deploy
 
-These are real gaps in the current tree, not warnings. Fix 0.1 and 0.2 before any
-environment will work end to end.
+The schema mismatch and the missing bootstrap path described in earlier revisions
+of this guide are now fixed in code. What remains is configuration.
 
-### 0.1 The schema does not match what EF Core queries
+### 0.1 Schema
 
-`infra/db/postgres-init.sql` creates **snake_case** tables (`organizations`,
-`memberships.per_user_quota_json`). `GatewayDbContext` configures no naming
-convention, so EF Core maps to its defaults — **PascalCase**, quoted by Npgsql:
-`"Organizations"`, `"Memberships"."PerUserQuotaJson"`. Quoted identifiers are
-case-sensitive in Postgres, so every query fails with
-`42P01: relation "Users" does not exist`.
+`GatewayDbContext` maps every entity explicitly to the snake_case tables in
+`infra/db/postgres-init.sql`, so EF and the init script agree and
+`docker compose up` works against a fresh volume with no migration step.
 
-There are also **no EF migrations committed** (no `Migrations/` directory) and
-`Program.cs` never calls `Migrate()` or `EnsureCreated()` — nothing creates the
-schema EF expects.
-
-Pick one fix:
-
-**Option A — generate migrations (recommended for production).** The init SQL
-becomes reference-only documentation.
+No EF migrations are committed. Once the schema starts changing, generate them and
+apply as a deploy step or K8s Job — the explicit mappings carry over unchanged:
 
 ```bash
 cd backend/src/Gateway.Api
 dotnet tool install --global dotnet-ef
 dotnet ef migrations add Initial
-dotnet ef database update --connection "Host=localhost;Port=5436;Database=gateway;Username=gateway;Password=<pw>"
+dotnet ef database update
 ```
 
-Then either run `dotnet ef database update` as a deploy step / K8s Job, or add
-migrate-on-boot to `Program.cs` (fine at 3 replicas; EF takes a Postgres advisory
-lock, so concurrent pods serialize):
+### 0.2 First admin
 
-```csharp
-using (var scope = app.Services.CreateScope())
-    await scope.ServiceProvider.GetRequiredService<GatewayDbContext>().Database.MigrateAsync();
-```
+`DatabaseBootstrapper` seeds one organization, workspace, super admin and
+membership the first time the gateway starts against an empty `users` table, then
+no-ops on every later start. Configure it before the first boot:
 
-**Option B — make EF speak snake_case**, matching the existing init SQL. Add the
-`EFCore.NamingConventions` package and one call:
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `BOOTSTRAP_ADMIN_EMAIL` | yes | login email for the super admin |
+| `BOOTSTRAP_ADMIN_PASSWORD` | yes | hashed with PBKDF2 on seed; warns under 12 chars |
+| `BOOTSTRAP_ADMIN_PHONE` | yes, unless OTP is off | E.164, e.g. `919876543210` |
+| `BOOTSTRAP_ORG_NAME` / `BOOTSTRAP_ORG_SLUG` | no | defaults to YourCompany / yourcompany |
 
-```csharp
-o.UseNpgsql(builder.Configuration.GetConnectionString("Postgres"))
- .UseSnakeCaseNamingConvention();
-```
+The phone number is required because admin logins are OTP-gated: an admin seeded
+without one gets `422 no_phone` at every login attempt. The seeder refuses to
+create an unusable account and logs an error instead.
 
-Option B keeps `docker compose up` working with zero migration steps. Option A is
-the right answer once the schema starts changing.
+### 0.3 Admin login without an OTP bot
 
-### 0.2 There is no way to create the first user
+`WHATSAPP_ENABLED=false` lets OrgAdmin and SuperAdmin log in with a password
+alone, for deployments with no WhatsApp bot. This removes the second factor from
+every admin account — each such login is recorded as `admin_login_without_otp` in
+the audit log, and the gateway logs a warning at startup.
 
-`AuthController` exposes only `login`, `verify-otp`, `refresh`, `logout` — no
-registration. `AdminUsersController` requires an `OrgAdmin` JWT, and no seed data
-exists. So on a fresh database nobody can log in and nobody can be created.
+With OTP enabled, a delivery failure now returns `502 otp_delivery_failed`.
+Previously the gateway swallowed the error and handed back a pending token that
+could never be completed, locking the admin out with no diagnostic.
 
-Insert the first org + workspace + user + membership by hand. Generate the
-password hash in `PasswordHasher`'s exact format (`{iterations}.{saltB64}.{hashB64}`,
-PBKDF2-SHA256, 600k iterations, 16-byte salt, 32-byte key):
+### 0.4 Rotate the committed secret
 
-```bash
-python3 -c "
-import hashlib, os, base64
-salt = os.urandom(16)
-key  = hashlib.pbkdf2_hmac('sha256', b'CHANGE-ME', salt, 600000, 32)
-print(f'600000.{base64.b64encode(salt).decode()}.{base64.b64encode(key).decode()}')
-"
-```
-
-Then seed (table/column casing per the option you chose in 0.1 — shown here for
-Option A / PascalCase):
-
-```sql
-INSERT INTO "Organizations" ("Id","Name","Slug","PlanCode","IsActive","CreatedAt")
-VALUES ('00000000-0000-0000-0000-000000000001','YourCompany','yourcompany','free',true,now());
-
-INSERT INTO "Workspaces" ("Id","OrganizationId","Name","IsActive")
-VALUES ('00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','Default',true);
-
-INSERT INTO "Users" ("Id","OrganizationId","Email","PasswordHash","PhoneVerified","IsActive","CreatedAt")
-VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000001',
-        'admin@yourcompany.com','<hash from above>',true,true,now());
-
--- Role 3 = SuperAdmin (see Domain/Entities.cs: User=0, WorkspaceAdmin=1, OrgAdmin=2, SuperAdmin=3)
-INSERT INTO "Memberships" ("Id","OrganizationId","UserId","WorkspaceId","Role")
-VALUES ('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000001',
-        '00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000002',3);
-```
-
-A proper fix is a one-shot bootstrap endpoint or a seeder that runs only when
-`Users` is empty.
-
-### 0.3 Rotate the committed secret
-
-`WHATSAPP_BOT_API_KEY=sahil90413` is committed in `.env.example`, and
-`docker-compose.yml` falls back to the same literal
-(`WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-sahil90413}`). Treat it as leaked:
-rotate it at the bot, and replace the compose default with an empty fallback.
+`WHATSAPP_BOT_API_KEY=sahil90413` was committed in `.env.example` and duplicated
+as a fallback in both `docker-compose.yml` and `WhatsAppOptions`. All three now
+default to empty, but the value is in git history — **rotate it at the bot.**
 
 ---
 
@@ -281,6 +237,52 @@ next to the binary — `Gateway.Api.csproj` marks them `CopyToOutputDirectory`, 
 
 ---
 
+## 3a. Managing quota and models
+
+`AdminQuotaController` (policy `OrgAdmin`) is the write path for the fields
+`QuotaPolicyResolver` reads. All routes take a JWT with an OrgAdmin or SuperAdmin
+role.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/v1/admin/users/{id}/quota` | the user's override plus their effective policy |
+| `PUT /api/v1/admin/users/{id}/quota` | set per-user windows and/or model allow-list |
+| `DELETE /api/v1/admin/users/{id}/quota` | drop the override, inherit the workspace |
+| `GET /api/v1/admin/workspaces/{id}/policy` | current workspace policy |
+| `PUT /api/v1/admin/workspaces/{id}/policy` | partial update; omitted fields keep their value |
+
+```bash
+# Tighten one employee to 50k per 5h and a 500k monthly ceiling, Sonnet only
+curl -X PUT "http://<host>/api/v1/admin/users/<user-id>/quota" \
+  -H "authorization: Bearer $JWT" -H 'content-type: application/json' \
+  -d '{
+        "windows": [
+          {"name":"w5h","tokenLimit":50000,"windowMinutes":300},
+          {"name":"monthly","tokenLimit":500000,"windowMinutes":43200}
+        ],
+        "allowedModels": ["claude-sonnet-4-6"]
+      }'
+```
+
+Pass `?workspaceId=` when the user belongs to more than one workspace — quota is
+owned by `(user, workspace)`, so the endpoint refuses to guess.
+
+Things worth knowing before you change a live policy:
+
+- **Renaming a window orphans its counter.** The window name is part of the Redis
+  key (`quota:user:{id}:user:{name}`), so a rename starts a fresh counter at zero
+  and the old one expires on its own TTL. Changing only a limit keeps the counter.
+- **Lowering a limit below current usage blocks that user** until the window's TTL
+  expires. That is the intended behavior, not a bug.
+- **Propagation is bounded by the 30s policy cache.** A write evicts the entry on
+  the pod that served it; other replicas refresh within 30 seconds.
+- **Models are validated against the registered providers** — a model no provider
+  serves is rejected with `unknown_model` rather than failing later at request time.
+- Every write lands in `audit_logs` as `user_quota_set`, `user_quota_cleared`, or
+  `workspace_policy_set`.
+
+---
+
 ## 4. Observability
 
 - `/metrics` — Prometheus scrape endpoint (`MapPrometheusScrapingEndpoint`).
@@ -309,13 +311,11 @@ Migrations are not auto-reverted — roll schema changes forward.
 
 ## 6. Extension checklist
 
-- [ ] EF migrations + a schema-creation step (blocker 0.1)
-- [ ] Bootstrap/seed path for the first super admin (blocker 0.2)
-- [ ] Admin write endpoints for quota policy JSON — `Membership.PerUserQuotaJson`
-      and `Workspace.QuotaPolicyJson` are read by `QuotaPolicyResolver` but nothing
-      writes them, so per-user limits can only be set with direct SQL
-- [ ] Per-user model allow-lists — `AllowedModels` is resolved from the workspace
-      policy only; the per-user blob's copy is discarded
+- [x] Explicit snake_case schema mapping so EF matches `postgres-init.sql`
+- [x] Bootstrap/seed path for the first super admin
+- [x] Admin write endpoints for quota policy JSON (`AdminQuotaController`)
+- [x] Per-user model allow-lists
+- [ ] EF migrations, once the schema starts changing
 - [ ] Enforce `RequestsPerMinute` — resolved into `EffectivePolicy`, never used
 - [ ] Honor `WindowKind.Fixed` — the Lua only implements rolling TTL windows
 - [ ] Frontend K8s Deployment + Service (referenced by `ingress.yaml`)

@@ -5,7 +5,14 @@ namespace Gateway.Api.Auth;
 public sealed class WhatsAppOptions
 {
     public string BotUrl { get; set; } = "http://host.docker.internal:3000";
-    public string ApiKey { get; set; } = "sahil90413";
+    public string ApiKey { get; set; } = "";
+
+    /// <summary>
+    /// When false, admin logins skip the WhatsApp OTP step and receive a JWT from
+    /// the password check alone. Set this only where no OTP bot is reachable —
+    /// it removes the second factor from every OrgAdmin and SuperAdmin login.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class WhatsAppGatewayClient
@@ -21,7 +28,8 @@ public sealed class WhatsAppGatewayClient
         _log = log;
     }
 
-    public async Task SendOtpAsync(string phoneNumber, string otp, CancellationToken ct = default)
+    /// <summary>Returns true only when the gateway accepted the message.</summary>
+    public async Task<bool> SendOtpAsync(string phoneNumber, string otp, CancellationToken ct = default)
     {
         var message =
             $"🔐 *YourCompany AI*\n\n" +
@@ -35,14 +43,19 @@ public sealed class WhatsAppGatewayClient
         try
         {
             var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode)
-                _log.LogWarning("WhatsApp send failed: {Status}", resp.StatusCode);
+            if (resp.IsSuccessStatusCode) return true;
+
+            _log.LogWarning("WhatsApp send failed: {Status}", resp.StatusCode);
+            return false;
         }
         catch (Exception ex)
         {
-            // Non-fatal — log and continue; user will see "OTP sent" regardless
-            // to prevent phone number enumeration via timing.
+            // Reported to the caller rather than swallowed: the password has already
+            // been verified by this point, so there is no enumeration risk in saying
+            // delivery failed — and hiding it locks the admin out with a pending
+            // token that can never be completed.
             _log.LogError(ex, "WhatsApp gateway unreachable");
+            return false;
         }
     }
 }

@@ -48,6 +48,9 @@ public sealed class ProviderRouter
         _log = log;
     }
 
+    /// <summary>True when some registered provider can serve this model.</summary>
+    public bool IsSupported(string model) => _providers.Any(p => p.Supports(model));
+
     public async IAsyncEnumerable<ChatChunk> StreamAsync(
         ChatRequest request,
         [EnumeratorCancellation] CancellationToken ct)

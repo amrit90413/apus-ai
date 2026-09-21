@@ -49,6 +49,7 @@ var redis = await ConnectionMultiplexer.ConnectAsync(builder.Configuration.GetCo
 builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
 builder.Services.AddSingleton<QuotaEngine>();
 builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<IPolicyCache, PolicyCache>();
 builder.Services.AddScoped<IQuotaPolicyResolver, QuotaPolicyResolver>();
 
 // ---- RabbitMQ publisher (singleton, channel reused) ----
@@ -104,11 +105,21 @@ builder.Services.AddHealthChecks()
     .AddNpgSql(builder.Configuration.GetConnectionString("Postgres")!, name: "postgres")
     .AddRedis(builder.Configuration.GetConnectionString("Redis")!, name: "redis");
 
+// ---- First-admin bootstrap (no-op once any user exists) ----
+var bootstrapOpt = builder.Configuration.GetSection("Bootstrap").Get<BootstrapOptions>() ?? new BootstrapOptions();
+
 var app = builder.Build();
 
 // Load quota Lua scripts once at startup.
 await app.Services.GetRequiredService<QuotaEngine>()
     .LoadScriptsAsync(Path.Combine(AppContext.BaseDirectory, "Quota"));
+
+await DatabaseBootstrapper.RunAsync(app.Services, bootstrapOpt,
+    app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Bootstrap"));
+
+if (!waOpt.Enabled)
+    app.Logger.LogWarning(
+        "WhatsApp OTP is disabled — OrgAdmin and SuperAdmin logins require only a password.");
 
 app.UseSerilogRequestLogging();
 app.UseMiddleware<TenantResolutionMiddleware>(); // sets ITenantContext from JWT
