@@ -55,10 +55,10 @@ pipeline {
                             sleep 5
                         done
 
-                        # Check Backend API
+                        # 2) Wait for Backend API to respond 200 OK (up to 90s)
                         for i in $(seq 1 18); do
-                            if curl -fsS --max-time 3 http://localhost:9001/health/ready > /dev/null 2>&1; then
-                                echo "✅ Backend API is ready"
+                            if docker compose exec -T gateway-api curl -fsS --max-time 3 http://localhost:8080/health/ready > /dev/null 2>&1; then
+                                echo "✅ Backend API is healthy"
                                 break
                             fi
                             if [ "$i" -eq 18 ]; then
