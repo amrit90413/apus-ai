@@ -57,7 +57,7 @@ pipeline {
 
                         # 2) Wait for Backend API to respond 200 OK (up to 90s)
                         for i in $(seq 1 18); do
-                            if docker compose exec -T gateway-api curl -fsS --max-time 3 http://localhost:8080/health/ready > /dev/null 2>&1; then
+                            if docker compose exec -T nginx wget -qO- http://gateway-api:8080/health/ready > /dev/null 2>&1; then
                                 echo "✅ Backend API is healthy"
                                 break
                             fi
