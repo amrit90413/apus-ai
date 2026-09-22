@@ -68,9 +68,12 @@ jobs:
           git show HEAD~1:infra/db/postgres-init.sql > /tmp/previous.sql 2>/dev/null \
             || cp infra/db/postgres-init.sql /tmp/previous.sql
           $PSQL -d upgraded -f /tmp/previous.sql
-          $PSQL -d upgraded -f infra/db/migrations/003_provider_connections_and_allowances.sql
+          $PSQL -d upgraded -f infra/db/migrations/003_token_allowance.sql
+          $PSQL -d upgraded -f infra/db/migrations/004_provider_connections_and_allowances.sql
       - name: Migrations are idempotent
-        run: $PSQL -d upgraded -f infra/db/migrations/003_provider_connections_and_allowances.sql
+        run: |
+          $PSQL -d upgraded -f infra/db/migrations/003_token_allowance.sql
+          $PSQL -d upgraded -f infra/db/migrations/004_provider_connections_and_allowances.sql
 
   cli:
     runs-on: ubuntu-latest

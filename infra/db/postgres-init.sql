@@ -125,10 +125,32 @@ CREATE TABLE api_keys (
 CREATE INDEX ix_api_keys_user ON api_keys(user_id);
 
 -- ---------------------------------------------------------------------------
--- Everything below is migration 003 (provider connections, currency allowance
+-- Migration 003 (recurring monthly token allowance), inlined so a fresh database
+-- matches an upgraded one. Keep it identical to
+-- infra/db/migrations/003_token_allowance.sql.
+-- ---------------------------------------------------------------------------
+
+
+ALTER TABLE memberships
+    -- Tokens credited each period. NULL = no recurring allowance (a one-off
+    -- balance set by an admin still works exactly as before).
+    ADD COLUMN IF NOT EXISTS allowance_tokens     bigint,
+    -- true: add to whatever is left. false: reset to allowance_tokens.
+    ADD COLUMN IF NOT EXISTS allowance_rollover   boolean NOT NULL DEFAULT false,
+    -- Last period credited, as 'YYYY-MM'. NULL = never credited.
+    ADD COLUMN IF NOT EXISTS allowance_period_key text;
+
+-- Finds memberships still awaiting this period's top-up. Partial: rows without an
+-- allowance are the overwhelming majority and never need scanning.
+CREATE INDEX IF NOT EXISTS ix_memberships_allowance_due
+    ON memberships(allowance_period_key)
+    WHERE allowance_tokens IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Everything below is migration 004 (provider connections, currency allowance
 -- periods, usage ledger, pricing, audit detail, notification outbox) inlined so a
 -- fresh database matches an upgraded one. Keep it identical to
--- infra/db/migrations/003_provider_connections_and_allowances.sql — the
+-- infra/db/migrations/004_provider_connections_and_allowances.sql — the
 -- SchemaParityTests in backend/tests assert the two stay in sync.
 -- ---------------------------------------------------------------------------
 

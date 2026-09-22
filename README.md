@@ -125,7 +125,8 @@ Existing databases need the migrations, in order and idempotent:
 
 ```bash
 psql "$POSTGRES_URL" -f infra/db/migrations/002_provider_credentials_and_token_balance.sql
-psql "$POSTGRES_URL" -f infra/db/migrations/003_provider_connections_and_allowances.sql
+psql "$POSTGRES_URL" -f infra/db/migrations/003_token_allowance.sql
+psql "$POSTGRES_URL" -f infra/db/migrations/004_provider_connections_and_allowances.sql
 ```
 
 Details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

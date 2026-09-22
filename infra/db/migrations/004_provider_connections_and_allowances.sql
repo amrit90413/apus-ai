@@ -1,4 +1,4 @@
--- Migration 003: provider connections (multi-provider, explicit state machine),
+-- Migration 004: provider connections (multi-provider, explicit state machine),
 -- currency allowance periods, the AI usage ledger, versioned provider pricing,
 -- richer audit records and the notification outbox.
 --
@@ -6,7 +6,7 @@
 -- default, no column is dropped or retyped, and the gateway keeps running against
 -- a database that has only migration 002 applied (new columns simply read as
 -- their defaults). Apply with:
---   psql "$POSTGRES_URL" -f infra/db/migrations/003_provider_connections_and_allowances.sql
+--   psql "$POSTGRES_URL" -f infra/db/migrations/004_provider_connections_and_allowances.sql
 --
 -- The one data change: where an organization has several active credentials for the
 -- same provider and purpose, all but the newest are marked disabled. Credential
@@ -91,7 +91,7 @@ WITH ranked AS (
 )
 UPDATE provider_credentials p
    SET status = 7, is_active = false,
-       last_failure_reason = coalesce(p.last_failure_reason, 'superseded by a newer connection (migration 003)')
+       last_failure_reason = coalesce(p.last_failure_reason, 'superseded by a newer connection (migration 004)')
   FROM ranked r
  WHERE p.id = r.id AND r.rn > 1;
 

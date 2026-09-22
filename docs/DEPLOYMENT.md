@@ -429,12 +429,13 @@ Migrations are not auto-reverted — roll schema changes forward.
 
 ---
 
-## Upgrading to multi-provider connections and allowances (migration 003)
+## Upgrading to multi-provider connections and allowances (migration 004)
 
 ### Apply
 
 ```bash
-psql "$POSTGRES_URL" -f infra/db/migrations/003_provider_connections_and_allowances.sql
+psql "$POSTGRES_URL" -f infra/db/migrations/003_token_allowance.sql
+psql "$POSTGRES_URL" -f infra/db/migrations/004_provider_connections_and_allowances.sql
 ```
 
 Idempotent and backward compatible: every column is added nullable or with a default,
@@ -443,7 +444,7 @@ against the upgraded schema (the new columns simply read as their defaults). App
 **before** rolling the new image, so the deploy is a normal rolling update.
 
 CI proves this on every push: a job builds the schema fresh, builds it again by applying
-003 to the previous schema, and runs 003 a second time.
+the migrations to the previous schema, and runs the last one a second time.
 
 ### The one data change
 

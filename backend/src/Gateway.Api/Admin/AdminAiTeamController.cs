@@ -12,10 +12,15 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Gateway.Api.Admin;
 
-/// <summary>Set a member's monthly AI allowance. Amounts are minor units of the organization's currency.</summary>
-public sealed record SetAllowanceRequest(long? MonthlyMinor, long? DailyMinor, bool? Unlimited, string? Note);
+/// <summary>
+/// Set a member's monthly AI *spend* budget, in minor units of the organization's
+/// currency. Distinct from SetAllowanceRequest in AdminBalanceController, which sets
+/// the recurring *token* top-up — the two limits are independent and both apply.
+/// </summary>
+public sealed record SetMoneyAllowanceRequest(long? MonthlyMinor, long? DailyMinor, bool? Unlimited, string? Note);
 
-public sealed record TopUpAllowanceRequest(long AmountMinor, string? Note);
+/// <summary>Add (or, negative, remove) spend budget inside the current period only.</summary>
+public sealed record TopUpMoneyAllowanceRequest(long AmountMinor, string? Note);
 
 public sealed record SetLimitsRequest(int? Rpm, int? Tpm, int? Concurrency, int? DailyRequests);
 
@@ -137,7 +142,7 @@ public sealed class AdminAiTeamController : ControllerBase
     /// </summary>
     [HttpPut("{userId:guid}/allowance")]
     [RequirePermission(Permissions.AllowanceUpdate)]
-    public async Task<IActionResult> SetAllowance(Guid userId, [FromQuery] Guid? workspaceId, [FromBody] SetAllowanceRequest req, CancellationToken ct)
+    public async Task<IActionResult> SetAllowance(Guid userId, [FromQuery] Guid? workspaceId, [FromBody] SetMoneyAllowanceRequest req, CancellationToken ct)
     {
         if (req.MonthlyMinor is { } m && m is < 0 or > MaxMinor) return Invalid("invalid_amount", "monthlyMinor is out of range.");
         if (req.DailyMinor is { } d && d is < 0 or > MaxMinor) return Invalid("invalid_amount", "dailyMinor is out of range.");
@@ -162,7 +167,7 @@ public sealed class AdminAiTeamController : ControllerBase
     /// <summary>Adds (or, with a negative amount, removes) budget inside the current period only.</summary>
     [HttpPost("{userId:guid}/allowance/top-up")]
     [RequirePermission(Permissions.AllowanceUpdate)]
-    public async Task<IActionResult> TopUp(Guid userId, [FromQuery] Guid? workspaceId, [FromBody] TopUpAllowanceRequest req, CancellationToken ct)
+    public async Task<IActionResult> TopUp(Guid userId, [FromQuery] Guid? workspaceId, [FromBody] TopUpMoneyAllowanceRequest req, CancellationToken ct)
     {
         if (req.AmountMinor == 0 || Math.Abs(req.AmountMinor) > MaxMinor)
             return Invalid("invalid_amount", "amountMinor must be non-zero and within range.");
