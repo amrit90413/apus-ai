@@ -559,6 +559,13 @@ public sealed class ProviderConnectionService : IProviderConnectionService
             row.LastFailureReason = Truncate(message, 400);
             row.LastError = row.LastFailureReason;
             if (row.Status == ConnectionStatus.Connected) row.Status = ConnectionStatus.Error;
+            // Repeated probe failures are no longer "transient"; stop handing the
+            // credential to user requests and tell the admin to reconnect.
+            if (row.FailureCount >= FailuresBeforeError)
+            {
+                row.Status = ConnectionStatus.ReauthenticationRequired;
+                row.IsActive = false;
+            }
         }
         await db.SaveChangesAsync(ct);
         InvalidateFor(row);
@@ -653,12 +660,12 @@ public sealed class ProviderConnectionService : IProviderConnectionService
         row.UpdatedAt = DateTimeOffset.UtcNow;
 
         // 401/403 means the credential itself is bad: an API key needs replacing, an
-        // OAuth grant needs the admin to log in again. Either way, stop serving it.
+        // OAuth grant needs the admin to log in again. Both need a human to reconnect,
+        // so both land in ReauthenticationRequired — Error is for transient upstream
+        // trouble that is still worth retrying, and CanServe lets those through.
         if (httpStatus is 401 or 403)
         {
-            row.Status = row.ConnectionType == ConnectionType.OAuth
-                ? ConnectionStatus.ReauthenticationRequired
-                : ConnectionStatus.Error;
+            row.Status = ConnectionStatus.ReauthenticationRequired;
             row.IsActive = false;
         }
         else if (row.FailureCount >= FailuresBeforeError && row.Status == ConnectionStatus.Connected)

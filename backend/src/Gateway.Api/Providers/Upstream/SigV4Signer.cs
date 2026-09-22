@@ -43,7 +43,10 @@ public static class SigV4Signer
 
         request.Headers.TryAddWithoutValidation("host", uri.IdnHost + (uri.IsDefaultPort ? "" : ":" + uri.Port));
         request.Headers.TryAddWithoutValidation("x-amz-date", amzDate);
-        request.Headers.TryAddWithoutValidation("x-amz-content-sha256", payloadHash);
+        // Only meaningful when there is a body; sending it on a bodyless GET just adds
+        // a header to sign, and AWS's own canonical examples omit it there.
+        if (payload.Length > 0)
+            request.Headers.TryAddWithoutValidation("x-amz-content-sha256", payloadHash);
         if (!string.IsNullOrEmpty(sessionToken))
             request.Headers.TryAddWithoutValidation("x-amz-security-token", sessionToken);
 
