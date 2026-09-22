@@ -13,6 +13,33 @@ export class SessionExpiredError extends Error {
   constructor() { super("Session expired"); this.name = "SessionExpiredError"; }
 }
 
+/**
+ * A non-2xx response from the gateway. `code` is the server's snake_case error
+ * code (`{ error: { code, message } }`) when the body carried one, otherwise
+ * `http_<status>`; `message` is the server's human text when present.
+ */
+export class ApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function toApiError(res: Response, path: string): Promise<ApiError> {
+  let code = `http_${res.status}`;
+  let message = `${res.status} ${path}`;
+  try {
+    const body = (await res.json()) as { error?: { code?: string; message?: string } } | null;
+    if (body?.error?.code) code = body.error.code;
+    if (body?.error?.message) message = body.error.message;
+  } catch { /* empty or non-JSON body: keep the generic message */ }
+  return new ApiError(res.status, code, message);
+}
+
 function store(tokens: LoginResult): void {
   localStorage.setItem(ACCESS_KEY, tokens.accessToken);
   localStorage.setItem(REFRESH_KEY, tokens.refreshToken);
@@ -101,7 +128,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<Respons
     res = await send(await getValidAccessToken(true));
   }
 
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  if (!res.ok) throw await toApiError(res, path);
   return res;
 }
 
@@ -110,30 +137,67 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
+async function sendJson<T>(method: "POST" | "PUT" | "PATCH", path: string, body: unknown): Promise<T> {
   const res = await request<T>(path, {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   return res.json() as Promise<T>;
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>("POST", path, body);
+}
+
+async function put<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>("PUT", path, body);
+}
+
 async function patch<T>(path: string, body: unknown): Promise<T> {
-  const res = await request<T>(path, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json() as Promise<T>;
+  return sendJson<T>("PATCH", path, body);
 }
 
 async function del(path: string): Promise<void> {
   await request<void>(path, { method: "DELETE" });
 }
 
+/** DELETE that returns a JSON body (e.g. the balance endpoints echo the new state). */
+async function delJson<T>(path: string): Promise<T> {
+  const res = await request<T>(path, { method: "DELETE" });
+  return res.json() as Promise<T>;
+}
+
+/** Optional `?workspaceId=` — only needed when the user is in more than one workspace. */
+function wsQuery(workspaceId?: string): string {
+  return workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : "";
+}
+
+// Public (unauthenticated) endpoints share the error shape but must not attach
+// or refresh a JWT, so they bypass `request`.
+async function publicFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${API}${path}`, init);
+  if (!res.ok) throw await toApiError(res, path);
+  return res.json() as Promise<T>;
+}
+
 export interface LoginResult { accessToken: string; refreshToken: string; accessExpiresAt: string; status?: never; }
 export interface OtpPendingResult { status: "otp_required"; pendingToken: string; message: string; }
+
+export interface RegisterAvailability {
+  enabled: boolean;
+  inviteCodeRequired: boolean;
+  phoneRequired: boolean;
+  minPasswordLength: number;
+}
+export interface RegisterRequest {
+  organizationName: string;
+  email: string;
+  password: string;
+  phoneNumber?: string;
+  inviteCode?: string;
+}
+export interface RegisterResult { organizationId: string; slug: string; workspaceId: string; userId: string; next: string; }
 
 export const authApi = {
   login: async (email: string, password: string): Promise<LoginResult | OtpPendingResult> => {
@@ -155,6 +219,16 @@ export const authApi = {
     if (!res.ok) throw new Error(`${res.status}`);
     return res.json() as Promise<LoginResult>;
   },
+  // Self-service organization signup. Availability tells the form which fields
+  // the gateway requires; `register` rejects with an ApiError carrying the
+  // server code (email_taken, weak_password, invalid_invite, phone_required...).
+  registerAvailability: () => publicFetch<RegisterAvailability>("/v1/auth/register"),
+  register: (body: RegisterRequest) =>
+    publicFetch<RegisterResult>("/v1/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   saveToken: (tokens: LoginResult) => store(tokens),
   logout: async () => {
     const refreshToken = localStorage.getItem(REFRESH_KEY);
@@ -184,8 +258,102 @@ export interface WindowState { name: string; used: number; limit: number; resetI
 export interface ProviderKeyRow { id: string; provider: string; keyHint: string; isActive: boolean; createdAt: string; }
 
 export interface UserUsage { inputTokens: number; outputTokens: number; costUsd: number; requests: number; lastActive: string; }
-export interface UserRow { id: string; email: string; phoneNumber?: string; phoneVerified: boolean; isActive: boolean; createdAt: string; role: string; workspaceId?: string; usage?: UserUsage; }
+export interface UserRow {
+  id: string;
+  email: string;
+  phoneNumber?: string;
+  phoneVerified: boolean;
+  isActive: boolean;
+  createdAt: string;
+  role: string;
+  workspaceId?: string;
+  /** Prepaid token allowance; null = unlimited (rolling windows still apply). */
+  tokenBalance: number | null;
+  usage?: UserUsage;
+}
 export interface WorkspaceRow { id: string; name: string; isActive: boolean; memberCount: number; }
+
+// Org-owned provider credentials (the organization's Claude connection).
+export type ProviderCredentialKind = "api_key" | "oauth";
+export interface ProviderCredentialRow {
+  id: string;
+  organizationId: string | null;
+  provider: string;
+  kind: ProviderCredentialKind;
+  hint: string;
+  isActive: boolean;
+  accessExpiresAt: string | null;
+  lastRefreshedAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+}
+export interface ProviderCredentialsResult {
+  credentials: ProviderCredentialRow[];
+  oauth: { enabled: boolean; provider: string };
+}
+export interface OAuthStartResult { authorizeUrl: string; expiresInSeconds: number; }
+export interface OAuthFinishResult { id: string; expiresAt: string | null; }
+export interface CredentialTestResult { ok: boolean; message: string; }
+
+// Prepaid token balance + ledger.
+export type LedgerKind = "grant" | "set" | "usage" | "revoke";
+export interface LedgerEntry {
+  id: number;
+  kind: LedgerKind;
+  delta: number;
+  balanceAfter: number | null;
+  actorUserId: string | null;
+  reference: string | null;
+  createdAt: string;
+}
+export interface BalanceResult {
+  userId: string;
+  workspaceId: string;
+  membershipId: string;
+  enforced: boolean;
+  balance: number | null;
+  history: LedgerEntry[];
+}
+
+// Per-user quota override and the workspace policy it falls back to.
+export interface QuotaOverride { userWindows?: unknown[]; allowedModels?: string[]; }
+export interface EffectiveQuota {
+  allowedModels: string[];
+  userWindows: unknown[];
+  workspaceWindows: unknown[];
+  requestsPerMinute: number;
+}
+export interface UserQuotaResult {
+  userId: string;
+  workspaceId: string;
+  hasOverride: boolean;
+  override: QuotaOverride | null;
+  effective: EffectiveQuota;
+}
+export interface WorkspacePolicy {
+  allowedModels: string[];
+  userWindows: unknown[];
+  workspaceWindows: unknown[];
+  requestsPerMinute: number;
+}
+export interface WorkspacePolicyResult {
+  workspaceId: string;
+  isDefault?: boolean;
+  policy?: WorkspacePolicy;
+  /** Some gateway versions return the policy fields at the top level. */
+  allowedModels?: string[];
+}
+
+// Personal `apus_...` keys a user minted for their IDE clients.
+export interface PersonalKeyRow {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
 
 export const adminApi = {
   // Super-admin: cross-tenant rollup (ClickHouse-backed).
@@ -195,11 +363,23 @@ export const adminApi = {
   topConsumers: (workspaceId: string) => get<{ consumers: ConsumerRow[]; window: WindowState }>(`/v1/admin/workspaces/${workspaceId}/top-consumers`),
   // User: own usage.
   myUsage: () => get<{ windows: WindowState[] }>("/v1/me/usage"),
-  // Super-admin: provider API key management.
+  // Super-admin: platform-wide fallback provider API keys.
   listProviderKeys: () => get<{ keys: ProviderKeyRow[] }>("/v1/admin/provider-keys"),
   addProviderKey: (provider: string, apiKey: string) =>
     post<{ id: string }>("/v1/admin/provider-keys", { provider, apiKey }),
   removeProviderKey: (id: string) => del(`/v1/admin/provider-keys/${id}`),
+
+  // Org-admin: the organization's own provider credential (API key or OAuth).
+  listProviderCredentials: () => get<ProviderCredentialsResult>("/v1/admin/provider-credentials"),
+  addProviderApiKey: (provider: string, apiKey: string) =>
+    post<{ id: string }>("/v1/admin/provider-credentials/api-key", { provider, apiKey }),
+  startProviderOAuth: () =>
+    post<OAuthStartResult>("/v1/admin/provider-credentials/oauth/start", { provider: "anthropic" }),
+  finishProviderOAuth: (code: string, state: string) =>
+    post<OAuthFinishResult>("/v1/admin/provider-credentials/oauth/callback", { code, state }),
+  testProviderCredential: (id: string) =>
+    post<CredentialTestResult>(`/v1/admin/provider-credentials/${id}/test`, {}),
+  removeProviderCredential: (id: string) => del(`/v1/admin/provider-credentials/${id}`),
 
   // Org-admin: user management.
   listUsers: () => get<{ users: UserRow[] }>("/v1/admin/users"),
@@ -211,6 +391,30 @@ export const adminApi = {
     post<{ sessionsRevoked: number }>(`/v1/admin/users/${id}/revoke-sessions`, {}),
   getUserActivity: (id: string) =>
     get<{ activity: unknown[] }>(`/v1/admin/users/${id}/activity`),
+
+  // Org-admin: prepaid token balance per user (null = unlimited).
+  getUserBalance: (id: string, workspaceId?: string) =>
+    get<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`),
+  grantTokens: (id: string, body: { tokens: number; note?: string; idempotencyKey?: string }, workspaceId?: string) =>
+    post<BalanceResult>(`/v1/admin/users/${id}/balance/grant${wsQuery(workspaceId)}`, body),
+  setTokens: (id: string, body: { tokens: number; note?: string }, workspaceId?: string) =>
+    put<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`, body),
+  revokeBalance: (id: string, workspaceId?: string) =>
+    delJson<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`),
+
+  // Org-admin: per-user model allowlist (override of the workspace policy).
+  getUserQuota: (id: string, workspaceId?: string) =>
+    get<UserQuotaResult>(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`),
+  setUserModels: (id: string, allowedModels: string[], workspaceId?: string) =>
+    put<{ userId: string; workspaceId: string; override: QuotaOverride }>(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`, { allowedModels }),
+  clearUserQuota: (id: string, workspaceId?: string) =>
+    del(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`),
+  getWorkspacePolicy: (id: string) =>
+    get<WorkspacePolicyResult>(`/v1/admin/workspaces/${id}/policy`),
+
+  // Org-admin: a user's personal gateway keys.
+  listUserKeys: (id: string) => get<{ keys: PersonalKeyRow[] }>(`/v1/admin/users/${id}/keys`),
+  revokeUserKey: (id: string, keyId: string) => del(`/v1/admin/users/${id}/keys/${keyId}`),
 
   // Org-admin: workspace/team management.
   listWorkspaces: () => get<{ workspaces: WorkspaceRow[] }>("/v1/admin/workspaces"),
@@ -228,6 +432,13 @@ export function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`;
   return n.toString();
+}
+
+/** Human-readable message for a thrown value; prefers the gateway's own text. */
+export function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message || fallback;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
 }
 
 // Poll an async loader every `ms` for "realtime" dashboards without websockets.

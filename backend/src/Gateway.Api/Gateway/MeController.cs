@@ -15,12 +15,13 @@ namespace Gateway.Api.Gateway;
 public sealed class MeController : ControllerBase
 {
     private readonly IQuotaPolicyResolver _policies;
+    private readonly ITokenBalanceService _balances;
     private readonly IConnectionMultiplexer _redis;
     private readonly GatewayDbContext _db;
 
-    public MeController(IQuotaPolicyResolver policies, IConnectionMultiplexer redis, GatewayDbContext db)
+    public MeController(IQuotaPolicyResolver policies, ITokenBalanceService balances, IConnectionMultiplexer redis, GatewayDbContext db)
     {
-        _policies = policies; _redis = redis; _db = db;
+        _policies = policies; _balances = balances; _redis = redis; _db = db;
     }
 
     private (Guid userId, Guid workspaceId, Guid sessionId) Identity()
@@ -46,7 +47,19 @@ public sealed class MeController : ControllerBase
             var ttl = await db.KeyTimeToLiveAsync(key);
             windows.Add(new { name = w.Name, used, limit = w.TokenLimit, resetInSeconds = (int)(ttl?.TotalSeconds ?? w.WindowSeconds) });
         }
-        return Ok(new { windows });
+
+        var balance = await _balances.GetAsync(policy.OrganizationId, new QuotaPrincipal(userId, workspaceId), ct);
+        return Ok(new { windows, balance = new { enforced = balance is not null, remaining = balance } });
+    }
+
+    /// <summary>Prepaid balance only — cheap enough for an IDE extension to poll after each reply.</summary>
+    [HttpGet("balance")]
+    public async Task<IActionResult> Balance(CancellationToken ct)
+    {
+        var (userId, workspaceId, _) = Identity();
+        var policy = await _policies.ResolveAsync(new QuotaPrincipal(userId, workspaceId), ct);
+        var balance = await _balances.GetAsync(policy.OrganizationId, new QuotaPrincipal(userId, workspaceId), ct);
+        return Ok(new { enforced = balance is not null, remaining = balance });
     }
 
     [HttpGet("models")]

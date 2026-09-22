@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -8,7 +9,7 @@ namespace Gateway.Api.Providers;
 
 public sealed class AnthropicOptions
 {
-    public string ApiKey { get; set; } = "";       // injected from K8s secret — never leaves the server
+    public string ApiKey { get; set; } = "";       // last-resort fallback from env/K8s secret — never leaves the server
     public string BaseUrl { get; set; } = "https://api.anthropic.com";
     public string Version { get; set; } = "2023-06-01";
 }
@@ -22,13 +23,13 @@ public sealed class AnthropicProvider : IAiProvider
 {
     private readonly HttpClient _http;
     private readonly AnthropicOptions _opt;
-    private readonly IProviderKeyService _keyService;
+    private readonly IProviderCredentialService _credentials;
 
-    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt, IProviderKeyService keyService)
+    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt, IProviderCredentialService credentials)
     {
         _http = http;
         _opt = opt.Value;
-        _keyService = keyService;
+        _credentials = credentials;
     }
 
     public string Name => "anthropic";
@@ -38,8 +39,11 @@ public sealed class AnthropicProvider : IAiProvider
         ChatRequest request,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        // DB key takes priority over env var so admins can rotate without redeploying.
-        var apiKey = await _keyService.GetActiveKeyAsync("anthropic", ct) ?? _opt.ApiKey;
+        // Org credential (API key or OAuth) > platform credential > env var. Stored
+        // credentials win so admins can rotate without redeploying.
+        var auth = await _credentials.ResolveAsync(request.OrganizationId, Name, ct)
+            ?? (string.IsNullOrWhiteSpace(_opt.ApiKey) ? null : new ProviderAuth(AuthScheme.ApiKey, _opt.ApiKey, Guid.Empty));
+        if (auth is null) throw new ProviderNotConfiguredException(Name);
 
         var system = request.Messages.FirstOrDefault(m => m.Role == "system")?.Content;
         var body = new
@@ -54,11 +58,18 @@ public sealed class AnthropicProvider : IAiProvider
         };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{_opt.BaseUrl}/v1/messages");
-        req.Headers.Add("x-api-key", apiKey);
+        ProviderCredentialService.ApplyAuth(req, auth.Scheme, auth.Secret);
         req.Headers.Add("anthropic-version", _opt.Version);
         req.Content = JsonContent.Create(body);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            // Revoked/rotated upstream. Drop the cached auth so the next request re-reads
+            // (and, for OAuth, re-refreshes) instead of failing for the cache lifetime.
+            _credentials.Invalidate(request.OrganizationId, Name);
+            throw new ProviderAuthException(Name, (int)resp.StatusCode);
+        }
         resp.EnsureSuccessStatusCode();
 
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
@@ -79,8 +90,11 @@ public sealed class AnthropicProvider : IAiProvider
             switch (type)
             {
                 case "message_start":
-                    inputTokens = root.GetProperty("message").GetProperty("usage")
-                        .GetProperty("input_tokens").GetInt32();
+                    // Cache reads/writes are billed input tokens too.
+                    var usage = root.GetProperty("message").GetProperty("usage");
+                    inputTokens = usage.GetProperty("input_tokens").GetInt32()
+                        + (usage.TryGetProperty("cache_creation_input_tokens", out var cc) && cc.TryGetInt32(out var ccv) ? ccv : 0)
+                        + (usage.TryGetProperty("cache_read_input_tokens", out var cr) && cr.TryGetInt32(out var crv) ? crv : 0);
                     break;
 
                 case "content_block_delta":

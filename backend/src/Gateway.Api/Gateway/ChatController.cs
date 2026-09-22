@@ -16,17 +16,21 @@ public sealed record GatewayChatRequest(string Model, List<ChatMessage> Messages
 [Authorize]
 public sealed class ChatController : ControllerBase
 {
+    private const int MaxMessages = 200;
+    private const int MaxMessageChars = 400_000;
+    private const int MaxMaxTokens = 128_000;
+
     private readonly ProviderRouter _router;
-    private readonly QuotaEngine _quota;
+    private readonly UsageGate _gate;
     private readonly IQuotaPolicyResolver _policies;
     private readonly IUsageEventPublisher _usage;
     private readonly ILogger<ChatController> _log;
 
     public ChatController(
-        ProviderRouter router, QuotaEngine quota, IQuotaPolicyResolver policies,
+        ProviderRouter router, UsageGate gate, IQuotaPolicyResolver policies,
         IUsageEventPublisher usage, ILogger<ChatController> log)
     {
-        _router = router; _quota = quota; _policies = policies; _usage = usage; _log = log;
+        _router = router; _gate = gate; _policies = policies; _usage = usage; _log = log;
     }
 
     [HttpPost("stream")]
@@ -39,34 +43,27 @@ public sealed class ChatController : ControllerBase
         var principal = new QuotaPrincipal(userId, workspaceId);
         var correlationId = HttpContext.TraceIdentifier;
 
-        // 2. Resolve which models + windows + rate limits apply to this principal.
-        var policy = await _policies.ResolveAsync(principal, ct);
-
-        if (!policy.AllowedModels.Contains(body.Model, StringComparer.OrdinalIgnoreCase))
+        if (Validate(body) is { } problem)
         {
-            await WriteError(403, "model_not_allowed",
-                $"Model '{body.Model}' is not enabled for this workspace.");
+            await WriteError(400, problem.code, problem.message);
             return;
         }
+
+        // 2. Resolve which models + windows + rate limits apply to this principal.
+        var policy = await _policies.ResolveAsync(principal, ct);
 
         // 3. Estimate input tokens for the up-front reservation (~4 chars/token heuristic;
         //    reconciled to the exact count after the provider responds).
         var charCount = body.Messages.Sum(m => m.Content.Length);
         long estimate = (charCount / 4) + body.MaxTokens;
 
-        // 4. Atomic reserve across all user + workspace windows.
-        var decision = await _quota.ReserveAsync(
-            principal, policy.UserWindows, policy.WorkspaceWindows, estimate, ct);
-
-        // Always surface quota headers so the CLI can render remaining/reset.
-        EmitQuotaHeaders(decision);
-
-        if (!decision.Allowed)
+        // 4. Allowlist → prepaid balance → atomic window reserve (see UsageGate).
+        var gate = await _gate.ReserveAsync(policy, principal, body.Model, estimate, correlationId, ct);
+        EmitQuotaHeaders(gate);
+        if (!gate.Allowed)
         {
-            var b = decision.Blocking;
-            await WriteError(429, "quota_exceeded",
-                $"Quota '{b?.Name}' exhausted. Resets in {b?.ResetInSeconds}s.",
-                retryAfter: b?.ResetInSeconds);
+            var status = gate.Code switch { "model_not_allowed" => 403, "balance_exhausted" => 402, _ => 429 };
+            await WriteError(status, gate.Code!, gate.Message!, retryAfter: gate.RetryAfterSeconds);
             return;
         }
 
@@ -81,7 +78,7 @@ public sealed class ChatController : ControllerBase
         try
         {
             await foreach (var chunk in _router.StreamAsync(
-                new ChatRequest(body.Model, body.Messages, body.MaxTokens, true), ct))
+                new ChatRequest(policy.OrganizationId, body.Model, body.Messages, body.MaxTokens, true), ct))
             {
                 if (chunk.Delta is not null)
                     await WriteEvent("token", new { text = chunk.Delta });
@@ -94,6 +91,18 @@ public sealed class ChatController : ControllerBase
             // Client (CLI Ctrl-C) cancelled — still reconcile what we reserved.
             faulted = true;
         }
+        catch (ProviderNotConfiguredException ex)
+        {
+            faulted = true;
+            _log.LogWarning("No provider credential for org {Org} provider {Provider} (corr {Corr})", policy.OrganizationId, ex.Provider, correlationId);
+            await WriteEvent("error", new { code = "provider_not_configured", message = "No AI provider is connected for your organization. Ask your admin to connect one." });
+        }
+        catch (ProviderAuthException ex)
+        {
+            faulted = true;
+            _log.LogError("Provider {Provider} rejected the credential ({Status}) for org {Org} (corr {Corr})", ex.Provider, ex.Status, policy.OrganizationId, correlationId);
+            await WriteEvent("error", new { code = "provider_auth_failed", message = "The AI provider rejected the organization's credential. Ask your admin to reconnect it." });
+        }
         catch (Exception ex)
         {
             faulted = true;
@@ -101,10 +110,10 @@ public sealed class ChatController : ControllerBase
             await WriteEvent("error", new { code = "provider_error", message = "Upstream AI provider failed." });
         }
 
-        // 6. Reconcile reserved estimate -> real tokens (clamps counters correctly).
+        // 6. Reconcile reserved estimate -> real tokens (never cancelled: a client
+        //    disconnect must not skip the refund).
         var realTokens = finalUsage?.Total ?? (faulted ? 0 : estimate);
-        await _quota.ReconcileAsync(principal, policy.UserWindows, policy.WorkspaceWindows,
-            estimate, realTokens, ct);
+        var balanceAfter = await _gate.ReconcileAsync(policy, principal, gate, body.Model, estimate, realTokens, correlationId);
 
         // 7. Fire async usage event to RabbitMQ — NO synchronous DB write in the hot path.
         await _usage.PublishAsync(new UsageEvent(
@@ -124,12 +133,31 @@ public sealed class ChatController : ControllerBase
             ClientIp: HttpContext.Connection.RemoteIpAddress?.ToString() // anomaly detection only
         ), ct);
 
-        await WriteEvent("done", new { usage = finalUsage, correlationId });
+        await WriteEvent("done", new { usage = finalUsage, balanceRemaining = balanceAfter, correlationId });
     }
 
-    private void EmitQuotaHeaders(QuotaDecision decision)
+    private static (string code, string message)? Validate(GatewayChatRequest body)
     {
-        var tightest = decision.Windows.OrderBy(w => w.Remaining).FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(body.Model) || body.Model.Length > 64)
+            return ("invalid_model", "model is required.");
+        if (body.Messages is null || body.Messages.Count is 0 or > MaxMessages)
+            return ("invalid_messages", $"Provide between 1 and {MaxMessages} messages.");
+        if (body.MaxTokens is < 1 or > MaxMaxTokens)
+            return ("invalid_max_tokens", $"maxTokens must be between 1 and {MaxMaxTokens}.");
+        foreach (var m in body.Messages)
+        {
+            if (m.Role is not ("user" or "assistant" or "system"))
+                return ("invalid_role", "Message role must be user, assistant or system.");
+            if (m.Content is null || m.Content.Length > MaxMessageChars)
+                return ("invalid_content", $"Each message must be at most {MaxMessageChars} characters.");
+        }
+        return null;
+    }
+
+    private void EmitQuotaHeaders(GateResult gate)
+    {
+        if (gate.Balance.Enforced) Response.Headers["X-Balance-Remaining"] = (gate.Balance.Remaining ?? 0).ToString();
+        var tightest = gate.Windows?.Windows.OrderBy(w => w.Remaining).FirstOrDefault();
         if (tightest is null) return;
         Response.Headers["X-Quota-Window"] = tightest.Name;
         Response.Headers["X-Quota-Remaining"] = tightest.Remaining.ToString();
@@ -155,16 +183,24 @@ public sealed class ChatController : ControllerBase
 
 public static class CostTable
 {
-    // $ per 1M tokens. Keep in config in production; hardcoded here for clarity.
+    // $ per 1M tokens (Anthropic list price, input/output). Keep in config in production.
     private static readonly Dictionary<string, (decimal inUsd, decimal outUsd)> Prices = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["claude-opus-4-7"]   = (15m, 75m),
-        ["claude-sonnet-4-6"] = (3m, 15m),
-        ["gpt-4o"]            = (2.5m, 10m),
+        ["claude-fable-5-1"]   = (10m, 50m),
+        ["claude-fable-5"]     = (10m, 50m),
+        ["claude-opus-5"]      = (5m, 25m),
+        ["claude-opus-4-8"]    = (5m, 25m),
+        ["claude-opus-4-7"]    = (5m, 25m),
+        ["claude-opus-4-6"]    = (5m, 25m),
+        ["claude-sonnet-5"]    = (2m, 10m),
+        ["claude-sonnet-4-6"]  = (3m, 15m),
+        ["claude-haiku-4-5"]   = (1m, 5m),
+        ["claude-haiku-4-5-20251001"] = (1m, 5m),
+        ["gpt-4o"]             = (2.5m, 10m),
         // Ollama — free local models
-        ["llama3.2"]          = (0m, 0m),
-        ["mistral"]           = (0m, 0m),
-        ["gemma2"]            = (0m, 0m),
+        ["llama3.2"]           = (0m, 0m),
+        ["mistral"]            = (0m, 0m),
+        ["gemma2"]             = (0m, 0m),
     };
 
     public static decimal Estimate(string model, TokenUsage? usage)

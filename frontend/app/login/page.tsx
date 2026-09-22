@@ -1,5 +1,6 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { authApi } from "@/lib/api";
 
@@ -16,6 +17,16 @@ export default function LoginPage() {
   const [otp, setOtp] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Only offer self-service signup when the gateway has it switched on.
+  const [signupEnabled, setSignupEnabled] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    authApi.registerAvailability()
+      .then(a => { if (alive) setSignupEnabled(a.enabled); })
+      .catch(() => { /* availability is informational; the form works without it */ });
+    return () => { alive = false; };
+  }, []);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -95,6 +106,11 @@ export default function LoginPage() {
             >
               {loading ? "Signing in…" : "Sign in"}
             </button>
+            {signupEnabled && (
+              <p className="text-center text-xs text-neutral-400">
+                New here? <Link href="/register" className="hover:underline">Create an organization</Link>
+              </p>
+            )}
           </form>
         ) : (
           <form onSubmit={handleVerifyOtp} className="space-y-4">

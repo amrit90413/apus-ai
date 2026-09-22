@@ -25,9 +25,14 @@ public static class PasswordHasher
     {
         var parts = stored.Split('.');
         if (parts.Length != 3) return false;
-        var iterations = int.Parse(parts[0]);
-        var salt = Convert.FromBase64String(parts[1]);
-        var expected = Convert.FromBase64String(parts[2]);
+        if (!int.TryParse(parts[0], out var iterations) || iterations < 1) return false;
+        byte[] salt, expected;
+        try
+        {
+            salt = Convert.FromBase64String(parts[1]);
+            expected = Convert.FromBase64String(parts[2]);
+        }
+        catch (FormatException) { return false; } // corrupt row: deny, don't 500
         var actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, HashAlgorithmName.SHA256, expected.Length);
         return CryptographicOperations.FixedTimeEquals(actual, expected); // constant-time
     }

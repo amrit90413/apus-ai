@@ -58,7 +58,16 @@ services:
       ConnectionStrings__Redis: "redis:6379"
       ConnectionStrings__RabbitMq: "amqp://gateway:${RABBITMQ_PASSWORD:-devpassword}@rabbitmq:5672"
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-change-me-min-32-bytes-long-secret-key}
-      Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional — set via super-admin dashboard instead
+      Encryption__DataKey: ${DATA_ENCRYPTION_KEY:-}
+      Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional platform-wide fallback
+      Anthropic__OAuth__ClientId: ${ANTHROPIC_OAUTH_CLIENT_ID:-}
+      Anthropic__OAuth__ClientSecret: ${ANTHROPIC_OAUTH_CLIENT_SECRET:-}
+      Anthropic__OAuth__AuthorizeUrl: ${ANTHROPIC_OAUTH_AUTHORIZE_URL:-}
+      Anthropic__OAuth__TokenUrl: ${ANTHROPIC_OAUTH_TOKEN_URL:-}
+      Anthropic__OAuth__Scopes: ${ANTHROPIC_OAUTH_SCOPES:-}
+      Anthropic__OAuth__RedirectUri: ${ANTHROPIC_OAUTH_REDIRECT_URI:-}
+      Registration__Enabled: ${REGISTRATION_ENABLED:-false}
+      Registration__InviteCode: ${REGISTRATION_INVITE_CODE:-}
       WhatsApp__Enabled: ${WHATSAPP_ENABLED:-true}
       WhatsApp__BotUrl: ${WHATSAPP_BOT_URL:-http://host.docker.internal:3000}
       WhatsApp__ApiKey: ${WHATSAPP_BOT_API_KEY:-}

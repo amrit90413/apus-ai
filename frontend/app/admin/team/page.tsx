@@ -2,6 +2,7 @@
 import { useCallback, useState } from "react";
 import { adminApi, usePolling } from "@/lib/api";
 import type { WorkspaceRow } from "@/lib/api";
+import AdminNav from "@/components/AdminNav";
 
 export default function AdminTeamPage() {
   const [selectedWs, setSelectedWs] = useState<string | null>(null);
@@ -51,6 +52,7 @@ export default function AdminTeamPage() {
 
   return (
     <div className="mx-auto max-w-4xl p-8">
+      <AdminNav />
       <header className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-medium">Teams</h1>

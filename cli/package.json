@@ -1,9 +1,9 @@
 {
-  "name": "yourcompany-ai",
-  "version": "0.1.0",
-  "description": "Enterprise AI gateway CLI \u2014 controlled, tracked, quota-enforced AI access.",
+  "name": "apus-ai",
+  "version": "0.2.0",
+  "description": "apus-ai gateway CLI — one-command setup for Claude Code, Cline and Roo Code through your organization's AI gateway.",
   "bin": {
-    "yourcompany-ai": "./dist/index.js"
+    "apus-ai": "./dist/index.js"
   },
   "type": "module",
   "engines": {
@@ -15,7 +15,8 @@
     "prepublishOnly": "npm run build"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "dependencies": {
     "commander": "^12.1.0",

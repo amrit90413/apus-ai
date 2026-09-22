@@ -29,7 +29,9 @@ public sealed class GatewayDbContext : DbContext
     public DbSet<Membership> Memberships => Set<Membership>();
     public DbSet<Session> Sessions => Set<Session>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
-    public DbSet<ProviderKey> ProviderKeys => Set<ProviderKey>();
+    public DbSet<ProviderCredential> ProviderCredentials => Set<ProviderCredential>();
+    public DbSet<TokenLedgerEntry> TokenLedger => Set<TokenLedgerEntry>();
+    public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -78,6 +80,7 @@ public sealed class GatewayDbContext : DbContext
             e.Property(x => x.WorkspaceId).HasColumnName("workspace_id");
             e.Property(x => x.Role).HasColumnName("role").HasConversion<int>();
             e.Property(x => x.PerUserQuotaJson).HasColumnName("per_user_quota_json").HasColumnType("jsonb");
+            e.Property(x => x.TokenBalance).HasColumnName("token_balance");
             e.HasIndex(x => new { x.UserId, x.WorkspaceId }).IsUnique();
         });
 
@@ -112,15 +115,63 @@ public sealed class GatewayDbContext : DbContext
             e.HasIndex(x => new { x.OrganizationId, x.At });
         });
 
-        b.Entity<ProviderKey>(e =>
+        b.Entity<ProviderCredential>(e =>
         {
-            e.ToTable("provider_keys");
+            e.ToTable("provider_credentials");
             e.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            e.Property(x => x.OrganizationId).HasColumnName("organization_id");
             e.Property(x => x.Provider).HasColumnName("provider");
-            e.Property(x => x.EncryptedKey).HasColumnName("encrypted_key");
-            e.Property(x => x.KeyHint).HasColumnName("key_hint");
+            e.Property(x => x.Kind).HasColumnName("kind").HasConversion<int>();
+            e.Property(x => x.EncryptedSecret).HasColumnName("encrypted_secret");
+            e.Property(x => x.EncryptedRefreshToken).HasColumnName("encrypted_refresh_token");
+            e.Property(x => x.AccessExpiresAt).HasColumnName("access_expires_at");
+            e.Property(x => x.Scopes).HasColumnName("scopes");
+            e.Property(x => x.Hint).HasColumnName("hint");
             e.Property(x => x.IsActive).HasColumnName("is_active");
+            e.Property(x => x.CreatedBy).HasColumnName("created_by");
             e.Property(x => x.CreatedAt).HasColumnName("created_at");
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            e.Property(x => x.LastRefreshedAt).HasColumnName("last_refreshed_at");
+            e.Property(x => x.LastError).HasColumnName("last_error");
+            e.HasIndex(x => new { x.OrganizationId, x.Provider, x.IsActive });
+        });
+
+        b.Entity<ApiKey>(e =>
+        {
+            e.ToTable("api_keys");
+            e.Ignore(x => x.IsActive);
+            e.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            e.Property(x => x.OrganizationId).HasColumnName("organization_id");
+            e.Property(x => x.UserId).HasColumnName("user_id");
+            e.Property(x => x.WorkspaceId).HasColumnName("workspace_id");
+            e.Property(x => x.Name).HasColumnName("name");
+            e.Property(x => x.KeyHash).HasColumnName("key_hash");
+            e.Property(x => x.Prefix).HasColumnName("prefix");
+            e.Property(x => x.CreatedAt).HasColumnName("created_at");
+            e.Property(x => x.LastUsedAt).HasColumnName("last_used_at");
+            e.Property(x => x.ExpiresAt).HasColumnName("expires_at");
+            e.Property(x => x.RevokedAt).HasColumnName("revoked_at");
+            e.HasIndex(x => x.KeyHash).IsUnique();
+            e.HasIndex(x => x.UserId);
+        });
+
+        b.Entity<TokenLedgerEntry>(e =>
+        {
+            e.ToTable("token_ledger");
+            e.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            e.Property(x => x.OrganizationId).HasColumnName("organization_id");
+            e.Property(x => x.MembershipId).HasColumnName("membership_id");
+            e.Property(x => x.UserId).HasColumnName("user_id");
+            e.Property(x => x.WorkspaceId).HasColumnName("workspace_id");
+            e.Property(x => x.Kind).HasColumnName("kind").HasConversion<int>();
+            e.Property(x => x.Delta).HasColumnName("delta");
+            e.Property(x => x.BalanceAfter).HasColumnName("balance_after");
+            e.Property(x => x.ActorUserId).HasColumnName("actor_user_id");
+            e.Property(x => x.Reference).HasColumnName("reference");
+            e.Property(x => x.IdempotencyKey).HasColumnName("idempotency_key");
+            e.Property(x => x.CreatedAt).HasColumnName("created_at");
+            e.HasIndex(x => new { x.MembershipId, x.CreatedAt });
+            e.HasIndex(x => new { x.OrganizationId, x.IdempotencyKey }).IsUnique();
         });
 
         // Tenant isolation — SuperAdmin bypasses by setting CurrentOrganizationId = null.
@@ -129,6 +180,11 @@ public sealed class GatewayDbContext : DbContext
         b.Entity<Membership>().HasQueryFilter(m => _tenant.CurrentOrganizationId == null || m.OrganizationId == _tenant.CurrentOrganizationId);
         b.Entity<Session>().HasQueryFilter(s => _tenant.CurrentOrganizationId == null || s.OrganizationId == _tenant.CurrentOrganizationId);
         b.Entity<AuditLog>().HasQueryFilter(a => _tenant.CurrentOrganizationId == null || a.OrganizationId == _tenant.CurrentOrganizationId);
+        b.Entity<TokenLedgerEntry>().HasQueryFilter(t => _tenant.CurrentOrganizationId == null || t.OrganizationId == _tenant.CurrentOrganizationId);
+        b.Entity<ApiKey>().HasQueryFilter(k => _tenant.CurrentOrganizationId == null || k.OrganizationId == _tenant.CurrentOrganizationId);
+        // Platform-wide credentials (OrganizationId null) are visible to every tenant as a
+        // fallback; org-owned rows are scoped like everything else.
+        b.Entity<ProviderCredential>().HasQueryFilter(c => _tenant.CurrentOrganizationId == null || c.OrganizationId == null || c.OrganizationId == _tenant.CurrentOrganizationId);
     }
 }
 

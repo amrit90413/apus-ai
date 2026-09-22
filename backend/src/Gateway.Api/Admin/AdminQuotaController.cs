@@ -192,29 +192,9 @@ public sealed class AdminQuotaController : ControllerBase
 
     // ------------------------------------------------------------------ helpers
 
-    private async Task<(Membership? membership, IActionResult? error)> ResolveMembership(
-        Guid userId, Guid? workspaceId, CancellationToken ct)
-    {
-        var memberships = await _db.Memberships.Where(m => m.UserId == userId).ToListAsync(ct);
-
-        if (memberships.Count == 0)
-            return (null, NotFound(new { error = new { code = "membership_not_found", message = "User has no workspace membership." } }));
-
-        if (workspaceId is null)
-        {
-            // Don't guess when the user spans workspaces — quota is per (user, workspace).
-            if (memberships.Count > 1)
-                return (null, Invalid(
-                    "User belongs to multiple workspaces. Pass ?workspaceId= to choose one.",
-                    "workspace_required"));
-            return (memberships[0], null);
-        }
-
-        var match = memberships.FirstOrDefault(m => m.WorkspaceId == workspaceId.Value);
-        return match is null
-            ? (null, NotFound(new { error = new { code = "membership_not_found", message = "User is not a member of that workspace." } }))
-            : (match, null);
-    }
+    private Task<(Membership? membership, IActionResult? error)> ResolveMembership(
+        Guid userId, Guid? workspaceId, CancellationToken ct) =>
+        MembershipLookup.ResolveAsync(_db, userId, workspaceId, ct);
 
     private IActionResult? Validate(QuotaWindow[]? windows, string[]? models)
     {

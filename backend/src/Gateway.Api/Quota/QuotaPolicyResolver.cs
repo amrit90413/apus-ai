@@ -138,7 +138,7 @@ public sealed class QuotaPolicyResolver : IQuotaPolicyResolver
         string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<UserOverride>(json, JsonOptions);
 
     public static StoredPolicy DefaultPolicy() => new(
-        AllowedModels: new[] { "claude-sonnet-4-6", "claude-opus-4-7" },
+        AllowedModels: new[] { "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5" },
         // Anthropic-style: 100k / 5h per user, 1M / day at the workspace.
         UserWindows: new[] { QuotaWindow.Every(300, 100_000, "w5h") },
         WorkspaceWindows: new[] { QuotaWindow.Daily(1_000_000) },

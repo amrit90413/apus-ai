@@ -64,6 +64,7 @@ public sealed class AdminUsersController : ControllerBase
                 u.CreatedAt,
                 Role = membership?.Role.ToString() ?? "User",
                 WorkspaceId = membership?.WorkspaceId,
+                TokenBalance = membership?.TokenBalance, // null = unlimited (windows only)
                 Usage = stat is null ? null : new
                 {
                     stat.InputTokens,

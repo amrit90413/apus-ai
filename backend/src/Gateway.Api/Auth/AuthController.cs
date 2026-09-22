@@ -4,6 +4,7 @@ using Gateway.Api.Domain;
 using Gateway.Api.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 namespace Gateway.Api.Auth;
@@ -32,6 +33,7 @@ public sealed class AuthController : ControllerBase
     }
 
     [HttpPost("login")]
+    [EnableRateLimiting("auth")]
     public async Task<IActionResult> Login([FromBody] LoginRequest req, CancellationToken ct)
     {
         var user = await _db.Users.IgnoreQueryFilters()
@@ -80,6 +82,7 @@ public sealed class AuthController : ControllerBase
     }
 
     [HttpPost("verify-otp")]
+    [EnableRateLimiting("auth")]
     public async Task<IActionResult> VerifyOtp([FromBody] VerifyOtpRequest req, CancellationToken ct)
     {
         var userId = await _otp.VerifyOtpAsync(req.PendingToken, req.Otp);

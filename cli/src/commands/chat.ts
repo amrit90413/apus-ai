@@ -75,7 +75,7 @@ export async function chat(opts: ChatOptions): Promise<void> {
   const token = await getValidAccessToken(creds);
   const history: { role: string; content: string }[] = [];
 
-  // Non-interactive one-shot: `yourcompany-ai chat -p "..."` (good for shell pipes).
+  // Non-interactive one-shot: `apus-ai chat -p "..."` (good for shell pipes).
   if (opts.once) {
     history.push({ role: "user", content: opts.once });
     await streamTurn(creds.apiBase, token, opts.model, history);
