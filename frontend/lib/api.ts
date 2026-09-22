@@ -214,7 +214,7 @@ export const authApi = {
       body: JSON.stringify({ email, password, deviceName: "web" }),
     });
     if (res.status === 202) return res.json() as Promise<OtpPendingResult>;
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw await toApiError(res, "/v1/auth/login");
     return res.json() as Promise<LoginResult>;
   },
   verifyOtp: async (pendingToken: string, otp: string): Promise<LoginResult> => {
@@ -223,7 +223,7 @@ export const authApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pendingToken, otp }),
     });
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw await toApiError(res, "/v1/auth/verify-otp");
     return res.json() as Promise<LoginResult>;
   },
   // Self-service organization signup. Availability tells the form which fields

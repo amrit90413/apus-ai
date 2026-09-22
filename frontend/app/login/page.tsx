@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { authApi } from "@/lib/api";
+import { authApi, ApiError } from "@/lib/api";
 
 type Step = "credentials" | "otp";
 
@@ -51,8 +51,10 @@ export default function LoginPage() {
         authApi.saveToken(result);
         router.push(nextPath());
       }
-    } catch {
-      setError("Invalid email or password.");
+    } catch (err) {
+      // 401 is the only case where the generic text is right; anything else (OTP
+      // bot down, rate limit, 5xx) carries a server message worth showing.
+      setError(err instanceof ApiError && err.status !== 401 ? err.message : "Invalid email or password.");
     } finally {
       setLoading(false);
     }
@@ -66,8 +68,8 @@ export default function LoginPage() {
       const result = await authApi.verifyOtp(pendingToken, otp);
       authApi.saveToken(result);
       router.push(nextPath());
-    } catch {
-      setError("Incorrect or expired OTP. Try again.");
+    } catch (err) {
+      setError(err instanceof ApiError && err.status !== 401 ? err.message : "Incorrect or expired OTP. Try again.");
       setOtp("");
     } finally {
       setLoading(false);
