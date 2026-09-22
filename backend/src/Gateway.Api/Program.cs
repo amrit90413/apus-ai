@@ -44,8 +44,11 @@ builder.Services.AddSingleton(builder.Configuration.GetSection("Registration").G
 // ---- WhatsApp OTP ----
 var waOpt = builder.Configuration.GetSection("WhatsApp").Get<WhatsAppOptions>() ?? new WhatsAppOptions();
 builder.Services.AddSingleton(waOpt);
+// The whatsapp-web.js bot queues sends with anti-ban delays (2-8s "typing", 30-60s
+// between messages), so a login can legitimately wait most of a minute for its OTP.
+// Kept under NGINX's 60s upstream read timeout on /api/.
 builder.Services.AddHttpClient<WhatsAppGatewayClient>()
-    .ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(10));
+    .ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(waOpt.SendTimeoutSeconds));
 builder.Services.AddScoped<OtpService>();
 
 // ---- Postgres + tenant scope ----

@@ -13,6 +13,9 @@ public sealed class WhatsAppOptions
     /// it removes the second factor from every OrgAdmin and SuperAdmin login.
     /// </summary>
     public bool Enabled { get; set; } = true;
+
+    /// <summary>How long a login may wait for the bot to accept the OTP message.</summary>
+    public int SendTimeoutSeconds { get; set; } = 55;
 }
 
 public sealed class WhatsAppGatewayClient
