@@ -60,7 +60,12 @@ public static class ConnectionStatuses
     };
 }
 
-public enum AllowanceScope { Organization = 0, User = 1 }
+/// <summary>
+/// Who a period belongs to. UserDaily is its own scope rather than a User row with a
+/// day-long window: on the 1st of a month the two would share a period_start and
+/// collide on the uniqueness index.
+/// </summary>
+public enum AllowanceScope { Organization = 0, User = 1, UserDaily = 2 }
 
 /// <summary>
 /// One owner's budget for one calendar period. A "monthly reset" opens the next

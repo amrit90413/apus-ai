@@ -220,12 +220,18 @@ public sealed class GatewayPipeline : IGatewayPipeline
             await slot.ReleaseAsync();
             await _rateLimiter.ReconcileAsync(rules.TokenRules, estimatedTokens, 0);
 
-            var code = allowance.Outcome == AllowanceOutcome.UserExceeded
-                ? GatewayErrorCodes.UserAllowanceExceeded
-                : GatewayErrorCodes.TenantAllowanceExceeded;
-            var message = allowance.Outcome == AllowanceOutcome.UserExceeded
-                ? $"Your monthly AI allowance is used up ({allowance.UserRemaining} left, {estimatedCost} needed). Ask your admin to top it up."
-                : $"Your organization's monthly AI budget is used up ({allowance.OrganizationRemaining} left). Ask your admin to raise it.";
+            var (code, message) = allowance.Outcome switch
+            {
+                AllowanceOutcome.UserDailyExceeded => (
+                    GatewayErrorCodes.UserDailyAllowanceExceeded,
+                    $"Your daily AI limit is used up ({allowance.UserRemaining} left, {estimatedCost} needed). It resets at midnight UTC."),
+                AllowanceOutcome.UserExceeded => (
+                    GatewayErrorCodes.UserAllowanceExceeded,
+                    $"Your monthly AI allowance is used up ({allowance.UserRemaining} left, {estimatedCost} needed). Ask your admin to top it up."),
+                _ => (
+                    GatewayErrorCodes.TenantAllowanceExceeded,
+                    $"Your organization's monthly AI budget is used up ({allowance.OrganizationRemaining} left). Ask your admin to raise it."),
+            };
 
             _metrics.RecordDenied(code, provider);
             await RecordBlockedAsync(request, policy, provider, model, code);
@@ -460,7 +466,8 @@ public sealed class GatewayPipeline : IGatewayPipeline
 
     private static AllowanceOwner OwnerFor(EffectivePolicy policy) => new(
         policy.OrganizationId, policy.MembershipId, policy.UserId, policy.WorkspaceId, policy.Currency,
-        policy.UserMonthlyAllowanceMinor, policy.UserUnlimitedAllowance, policy.OrganizationMonthlyBudgetMinor);
+        policy.UserMonthlyAllowanceMinor, policy.UserUnlimitedAllowance, policy.OrganizationMonthlyBudgetMinor,
+        policy.UserDailyAllowanceMinor);
 
     private static GatewayAdmission Deny(EffectivePolicy policy, string model, string code, string message, int? retryAfter = null) =>
         new()

@@ -20,6 +20,7 @@ public static class GatewayErrorCodes
     public const string UserAiAccessDisabled = "USER_AI_ACCESS_DISABLED";
     public const string TenantAiAccessDisabled = "TENANT_AI_ACCESS_DISABLED";
     public const string UserAllowanceExceeded = "USER_ALLOWANCE_EXCEEDED";
+    public const string UserDailyAllowanceExceeded = "USER_DAILY_ALLOWANCE_EXCEEDED";
     public const string TenantAllowanceExceeded = "TENANT_ALLOWANCE_EXCEEDED";
     public const string TokenBalanceExhausted = "TOKEN_BALANCE_EXHAUSTED";
     public const string QuotaExceeded = "QUOTA_EXCEEDED";
@@ -38,8 +39,8 @@ public static class GatewayErrorCodes
 
         // Not retryable without an admin doing something, so 402 rather than 429:
         // a client that retries a 429 forever would just burn its own rate limit.
-        UserAllowanceExceeded or TenantAllowanceExceeded or TokenBalanceExhausted
-            or SubscriptionInactive => (402, "permission_error"),
+        UserAllowanceExceeded or UserDailyAllowanceExceeded or TenantAllowanceExceeded
+            or TokenBalanceExhausted or SubscriptionInactive => (402, "permission_error"),
 
         QuotaExceeded or RateLimitExceeded or ConcurrencyLimitExceeded => (429, "rate_limit_error"),
 
