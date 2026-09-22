@@ -91,7 +91,9 @@ public sealed class AllowancePeriodWorker : PeriodicWorker
               FROM allowance_periods p
               JOIN organizations o ON o.id = p.organization_id
               LEFT JOIN memberships m ON m.id = p.membership_id
-             WHERE p.period_start = @currentStart
+             -- Monthly scopes only. A daily period on the 1st shares the month's
+             -- start date and would otherwise be rolled forward as a month-long row.
+             WHERE p.period_start = @currentStart AND p.scope IN (0, 1)
             ON CONFLICT DO NOTHING
             """;
 
@@ -111,7 +113,10 @@ public sealed class AllowancePeriodWorker : PeriodicWorker
         var (start, _) = AllowanceCalendar.Current(DateTimeOffset.UtcNow);
 
         var periods = await db.AllowancePeriods.IgnoreQueryFilters().AsNoTracking()
-            .Where(p => p.PeriodStart == start && !p.Unlimited && p.AllocatedMinor + p.AdjustmentMinor > 0)
+            // Monthly scopes only: a daily cap resets at midnight and does not warrant
+            // a "you have used 75% of your monthly allowance" message.
+            .Where(p => p.PeriodStart == start && p.Scope != AllowanceScope.UserDaily
+                        && !p.Unlimited && p.AllocatedMinor + p.AdjustmentMinor > 0)
             .Take(2000)
             .ToListAsync(ct);
 

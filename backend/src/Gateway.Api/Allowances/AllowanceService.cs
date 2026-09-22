@@ -17,20 +17,25 @@ public sealed record AllowanceOwner(
     string Currency,
     long? UserMonthlyMinor,
     bool UserUnlimited,
-    long? OrganizationMonthlyMinor);
+    long? OrganizationMonthlyMinor,
+    /// <summary>Optional per-day ceiling under the monthly one. Null = no daily cap.</summary>
+    long? UserDailyMinor = null);
 
 /// <summary>A held reservation. Every successful reserve must be settled exactly once.</summary>
 public sealed record AllowanceReservation(
     Guid UserPeriodId,
     Guid OrganizationPeriodId,
     long AmountMinor,
-    string Currency)
+    string Currency,
+    Guid UserDailyPeriodId = default)
 {
     public static readonly AllowanceReservation None = new(Guid.Empty, Guid.Empty, 0, "USD");
-    public bool Held => AmountMinor > 0 && (UserPeriodId != Guid.Empty || OrganizationPeriodId != Guid.Empty);
+
+    public bool Held => AmountMinor > 0 &&
+        (UserPeriodId != Guid.Empty || OrganizationPeriodId != Guid.Empty || UserDailyPeriodId != Guid.Empty);
 }
 
-public enum AllowanceOutcome { Allowed = 0, UserExceeded = 1, OrganizationExceeded = 2 }
+public enum AllowanceOutcome { Allowed = 0, UserExceeded = 1, OrganizationExceeded = 2, UserDailyExceeded = 3 }
 
 public sealed record AllowanceDecision(
     AllowanceOutcome Outcome,
@@ -83,6 +88,9 @@ public interface IAllowanceService
     Task<AllowanceSnapshot> UserPeriodAsync(AllowanceOwner owner, DateTimeOffset at, CancellationToken ct);
     Task<AllowanceSnapshot> OrganizationPeriodAsync(AllowanceOwner owner, DateTimeOffset at, CancellationToken ct);
 
+    /// <summary>The member's day period, or null when they have no daily cap.</summary>
+    Task<AllowanceSnapshot?> UserDailyPeriodAsync(AllowanceOwner owner, DateTimeOffset at, CancellationToken ct);
+
     /// <summary>Adds (or removes) budget within the current period without touching history.</summary>
     Task<AllowanceSnapshot> AdjustAsync(Guid periodId, long deltaMinor, CancellationToken ct);
 
@@ -120,12 +128,27 @@ public sealed class AllowanceService : IAllowanceService
         var now = DateTimeOffset.UtcNow;
         var userPeriod = await EnsureAsync(db, owner, AllowanceScope.User, now, ct);
         var orgPeriod = await EnsureAsync(db, owner, AllowanceScope.Organization, now, ct);
+        // Only opened when the member actually has a daily cap, so the common case
+        // costs nothing.
+        var dailyPeriod = owner.UserDailyMinor is null
+            ? null
+            : await EnsureAsync(db, owner, AllowanceScope.UserDaily, now, ct);
 
         var hold = Math.Max(0, amount.Minor);
+
+        // Tightest ceiling first, so a request blocked by the day never disturbs the
+        // month's or the tenant's counters.
+        if (dailyPeriod is not null && await TryHoldAsync(db, dailyPeriod.PeriodId, hold, ct) is null)
+        {
+            var current = await SnapshotAsync(db, dailyPeriod.PeriodId, ct);
+            return new AllowanceDecision(AllowanceOutcome.UserDailyExceeded, AllowanceReservation.None,
+                current.Available, Money.Zero(owner.Currency), true, !orgPeriod.Unlimited);
+        }
 
         var userOk = await TryHoldAsync(db, userPeriod.PeriodId, hold, ct);
         if (userOk is null)
         {
+            await ReleaseDailyAsync(db, dailyPeriod, hold);
             var current = await SnapshotAsync(db, userPeriod.PeriodId, ct);
             return new AllowanceDecision(AllowanceOutcome.UserExceeded, AllowanceReservation.None,
                 current.Available, Money.Zero(owner.Currency), !current.Unlimited, !orgPeriod.Unlimited);
@@ -134,9 +157,10 @@ public sealed class AllowanceService : IAllowanceService
         var orgOk = await TryHoldAsync(db, orgPeriod.PeriodId, hold, ct);
         if (orgOk is null)
         {
-            // Give the user hold back before answering: otherwise a tenant that is out of
-            // budget would slowly strangle every member's remaining allowance too.
+            // Give the member's holds back before answering: otherwise a tenant that is
+            // out of budget would slowly strangle every member's allowance too.
             await ReleaseOneAsync(db, userPeriod.PeriodId, hold, CancellationToken.None);
+            await ReleaseDailyAsync(db, dailyPeriod, hold);
             var orgCurrent = await SnapshotAsync(db, orgPeriod.PeriodId, ct);
             return new AllowanceDecision(AllowanceOutcome.OrganizationExceeded, AllowanceReservation.None,
                 new Money(Math.Max(0, userOk.Value), owner.Currency), orgCurrent.Available,
@@ -145,11 +169,15 @@ public sealed class AllowanceService : IAllowanceService
 
         return new AllowanceDecision(
             AllowanceOutcome.Allowed,
-            new AllowanceReservation(userPeriod.PeriodId, orgPeriod.PeriodId, hold, owner.Currency),
+            new AllowanceReservation(userPeriod.PeriodId, orgPeriod.PeriodId, hold, owner.Currency,
+                dailyPeriod?.PeriodId ?? Guid.Empty),
             new Money(Math.Max(0, userOk.Value), owner.Currency),
             new Money(Math.Max(0, orgOk.Value), owner.Currency),
             !userPeriod.Unlimited, !orgPeriod.Unlimited);
     }
+
+    private static Task ReleaseDailyAsync(GatewayDbContext db, PeriodRef? daily, long hold) =>
+        daily is null ? Task.CompletedTask : ReleaseOneAsync(db, daily.PeriodId, hold, CancellationToken.None);
 
     /// <summary>
     /// The atomic hold. One conditional UPDATE: an unlimited period always matches, a
@@ -187,6 +215,7 @@ public sealed class AllowanceService : IAllowanceService
         await using var tx = await db.Database.BeginTransactionAsync(CancellationToken.None);
         try
         {
+            await SettleOneAsync(db, reservation.UserDailyPeriodId, reservation.AmountMinor, actual.Minor, tokens, requests);
             await SettleOneAsync(db, reservation.UserPeriodId, reservation.AmountMinor, actual.Minor, tokens, requests);
             await SettleOneAsync(db, reservation.OrganizationPeriodId, reservation.AmountMinor, actual.Minor, tokens, requests);
             await tx.CommitAsync(CancellationToken.None);
@@ -224,6 +253,7 @@ public sealed class AllowanceService : IAllowanceService
         if (!reservation.Held) return;
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+        await ReleaseOneAsync(db, reservation.UserDailyPeriodId, reservation.AmountMinor, CancellationToken.None);
         await ReleaseOneAsync(db, reservation.UserPeriodId, reservation.AmountMinor, CancellationToken.None);
         await ReleaseOneAsync(db, reservation.OrganizationPeriodId, reservation.AmountMinor, CancellationToken.None);
     }
@@ -255,6 +285,16 @@ public sealed class AllowanceService : IAllowanceService
         await using var scope = _scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
         var period = await EnsureAsync(db, owner, AllowanceScope.Organization, at, ct);
+        return await SnapshotAsync(db, period.PeriodId, ct);
+    }
+
+    public async Task<AllowanceSnapshot?> UserDailyPeriodAsync(AllowanceOwner owner, DateTimeOffset at, CancellationToken ct)
+    {
+        if (owner.UserDailyMinor is null) return null;
+
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+        var period = await EnsureAsync(db, owner, AllowanceScope.UserDaily, at, ct);
         return await SnapshotAsync(db, period.PeriodId, ct);
     }
 
@@ -301,14 +341,18 @@ public sealed class AllowanceService : IAllowanceService
     private async Task<PeriodRef> EnsureAsync(
         GatewayDbContext db, AllowanceOwner owner, AllowanceScope scope, DateTimeOffset at, CancellationToken ct)
     {
-        var (start, end) = AllowanceCalendar.Current(at);
-        var isUser = scope == AllowanceScope.User;
+        var isDaily = scope == AllowanceScope.UserDaily;
+        var (start, end) = isDaily ? AllowanceCalendar.Day(at) : AllowanceCalendar.Current(at);
+        var isUser = scope != AllowanceScope.Organization;
 
         // A null budget means "track but do not cap": consumption still accrues so the
         // dashboards and the shared-pool view are accurate.
-        var budget = isUser
-            ? (owner.UserUnlimited ? null : owner.UserMonthlyMinor)
-            : owner.OrganizationMonthlyMinor;
+        var budget = scope switch
+        {
+            AllowanceScope.UserDaily => owner.UserDailyMinor,
+            AllowanceScope.User => owner.UserUnlimited ? null : owner.UserMonthlyMinor,
+            _ => owner.OrganizationMonthlyMinor,
+        };
         var unlimited = budget is null;
 
         const string insert = """

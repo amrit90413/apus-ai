@@ -44,8 +44,8 @@ public sealed class AllowanceServiceTests : IAsyncLifetime
         await db.SaveChangesAsync();
     }
 
-    private static AllowanceOwner Owner(long? userBudget, long? orgBudget, bool userUnlimited = false) =>
-        new(OrgId, MembershipId, UserId, WorkspaceId, "INR", userBudget, userUnlimited, orgBudget);
+    private static AllowanceOwner Owner(long? userBudget, long? orgBudget, bool userUnlimited = false, long? dailyBudget = null) =>
+        new(OrgId, MembershipId, UserId, WorkspaceId, "INR", userBudget, userUnlimited, orgBudget, dailyBudget);
 
     // -------------------------------------------------------------- basic flow
 
@@ -152,6 +152,121 @@ public sealed class AllowanceServiceTests : IAsyncLifetime
 
         var next = await _allowances.ReserveAsync(owner, new Money(1, "INR"), default);
         Assert.False(next.Allowed);
+    }
+
+    // ---------------------------------------------------------- daily ceiling
+
+    [PostgresFact]
+    public async Task A_daily_cap_binds_before_the_monthly_one()
+    {
+        // ₹1,000 for the month but only ₹100 today.
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 10_000);
+
+        var first = await _allowances.ReserveAsync(owner, new Money(6_000, "INR"), default);
+        var second = await _allowances.ReserveAsync(owner, new Money(6_000, "INR"), default);
+
+        Assert.True(first.Allowed);
+        Assert.False(second.Allowed);
+        Assert.Equal(AllowanceOutcome.UserDailyExceeded, second.Outcome);
+    }
+
+    [PostgresFact]
+    public async Task A_request_refused_by_the_day_leaves_the_month_and_the_tenant_untouched()
+    {
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 1_000);
+
+        var refused = await _allowances.ReserveAsync(owner, new Money(5_000, "INR"), default);
+        Assert.False(refused.Allowed);
+
+        var month = await _allowances.UserPeriodAsync(owner, DateTimeOffset.UtcNow, default);
+        var org = await _allowances.OrganizationPeriodAsync(owner, DateTimeOffset.UtcNow, default);
+
+        Assert.Equal(0, month.ReservedMinor);
+        Assert.Equal(0, month.ConsumedMinor);
+        Assert.Equal(0, org.ReservedMinor);
+    }
+
+    [PostgresFact]
+    public async Task Settling_charges_the_day_the_month_and_the_tenant_alike()
+    {
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 10_000);
+
+        var decision = await _allowances.ReserveAsync(owner, new Money(5_000, "INR"), default);
+        await _allowances.SettleAsync(decision.Reservation, new Money(800, "INR"), tokens: 50);
+
+        var daily = await _allowances.UserDailyPeriodAsync(owner, DateTimeOffset.UtcNow, default);
+        var month = await _allowances.UserPeriodAsync(owner, DateTimeOffset.UtcNow, default);
+
+        Assert.Equal(800, daily!.ConsumedMinor);
+        Assert.Equal(0, daily.ReservedMinor);
+        Assert.Equal(800, month.ConsumedMinor);
+        Assert.Equal(0, month.ReservedMinor);
+    }
+
+    [PostgresFact]
+    public async Task A_released_reservation_frees_the_day_too()
+    {
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 10_000);
+
+        var decision = await _allowances.ReserveAsync(owner, new Money(9_000, "INR"), default);
+        await _allowances.ReleaseAsync(decision.Reservation);
+
+        var daily = await _allowances.UserDailyPeriodAsync(owner, DateTimeOffset.UtcNow, default);
+        Assert.Equal(0, daily!.ReservedMinor);
+        Assert.True((await _allowances.ReserveAsync(owner, new Money(9_000, "INR"), default)).Allowed);
+    }
+
+    [PostgresFact]
+    public async Task Tomorrow_is_a_fresh_day_but_the_same_month()
+    {
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 10_000);
+        // Pick a day that is not the last of the month, so "tomorrow" stays in it.
+        var today = new DateTimeOffset(DateTime.UtcNow.Year, DateTime.UtcNow.Month, 10, 12, 0, 0, TimeSpan.Zero);
+
+        var todayPeriod = await _allowances.UserDailyPeriodAsync(owner, today, default);
+        var tomorrowPeriod = await _allowances.UserDailyPeriodAsync(owner, today.AddDays(1), default);
+        var month = await _allowances.UserPeriodAsync(owner, today, default);
+        var sameMonth = await _allowances.UserPeriodAsync(owner, today.AddDays(1), default);
+
+        Assert.NotEqual(todayPeriod!.PeriodId, tomorrowPeriod!.PeriodId);
+        Assert.Equal(month.PeriodId, sameMonth.PeriodId);
+    }
+
+    [PostgresFact]
+    public async Task A_daily_period_opened_on_the_first_does_not_collide_with_the_month()
+    {
+        // Both start at midnight on the 1st; only the distinct scope keeps them apart.
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000, dailyBudget: 10_000);
+        var firstOfMonth = new DateTimeOffset(DateTime.UtcNow.Year, DateTime.UtcNow.Month, 1, 0, 30, 0, TimeSpan.Zero);
+
+        var month = await _allowances.UserPeriodAsync(owner, firstOfMonth, default);
+        var day = await _allowances.UserDailyPeriodAsync(owner, firstOfMonth, default);
+
+        Assert.NotEqual(month.PeriodId, day!.PeriodId);
+        Assert.Equal(month.PeriodStart, day.PeriodStart);
+    }
+
+    [PostgresFact]
+    public async Task No_daily_cap_means_no_daily_period_is_opened()
+    {
+        var owner = Owner(userBudget: 100_000, orgBudget: 1_000_000);
+
+        var decision = await _allowances.ReserveAsync(owner, new Money(1_000, "INR"), default);
+
+        Assert.True(decision.Allowed);
+        Assert.Equal(Guid.Empty, decision.Reservation.UserDailyPeriodId);
+        Assert.Null(await _allowances.UserDailyPeriodAsync(owner, DateTimeOffset.UtcNow, default));
+    }
+
+    [PostgresFact]
+    public async Task Concurrent_requests_cannot_race_past_the_daily_cap_either()
+    {
+        var owner = Owner(userBudget: 10_000_000, orgBudget: 10_000_000, dailyBudget: 5_000);
+
+        var decisions = await Task.WhenAll(Enumerable.Range(0, 30)
+            .Select(_ => _allowances.ReserveAsync(owner, new Money(1_000, "INR"), default)));
+
+        Assert.Equal(5, decisions.Count(d => d.Allowed));
     }
 
     // ------------------------------------------------------------- concurrency

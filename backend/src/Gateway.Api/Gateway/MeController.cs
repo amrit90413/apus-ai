@@ -105,6 +105,7 @@ public sealed class MeController : ControllerBase
             policy.UserMonthlyAllowanceMinor, policy.UserUnlimitedAllowance, policy.OrganizationMonthlyBudgetMinor);
 
         var period = await _allowances.UserPeriodAsync(owner, DateTimeOffset.UtcNow, ct);
+        var daily = await _allowances.UserDailyPeriodAsync(owner, DateTimeOffset.UtcNow, ct);
         var connected = await _connections.ConnectedProvidersAsync(policy.OrganizationId, ct);
         var balance = await _balances.GetAsync(policy.OrganizationId, principal, ct);
 
@@ -134,6 +135,14 @@ public sealed class MeController : ControllerBase
                 resetsAt = period.PeriodEnd,
             },
             usage = new { requests = period.RequestCount, tokens = period.TokenCount },
+            // Null unless the admin set a daily cap; it binds before the monthly one.
+            daily = daily is null ? null : new
+            {
+                budgetMinor = daily.BudgetMinor,
+                usedMinor = daily.ConsumedMinor,
+                remainingMinor = Math.Max(0, daily.AvailableMinor),
+                resetsAt = daily.PeriodEnd,
+            },
             tokenBalance = new { enforced = balance is not null, remaining = balance },
             access = new
             {
