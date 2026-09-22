@@ -46,14 +46,17 @@ function store(tokens: LoginResult): void {
   localStorage.setItem(EXPIRES_KEY, tokens.accessExpiresAt);
 }
 
+// Pages that work without a session; never bounce these to /login.
+const PUBLIC_PATHS = new Set(["/login", "/register"]);
+
 function endSession(): SessionExpiredError {
   localStorage.removeItem(ACCESS_KEY);
   localStorage.removeItem(REFRESH_KEY);
   localStorage.removeItem(EXPIRES_KEY);
   // usePolling swallows rejections, so without this the dashboard would sit on
   // stale data instead of showing the user they have been signed out.
-  if (typeof window !== "undefined" && window.location.pathname !== "/login")
-    window.location.assign("/login");
+  if (typeof window !== "undefined" && !PUBLIC_PATHS.has(window.location.pathname))
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
   return new SessionExpiredError();
 }
 
@@ -119,6 +122,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<Respons
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
     });
+
+  // No session at all: don't fire an unauthenticated request every poll tick —
+  // send the visitor to sign in immediately.
+  if (typeof window !== "undefined" && !localStorage.getItem(ACCESS_KEY)) throw endSession();
 
   let res = await send(await getValidAccessToken());
 
@@ -362,7 +369,7 @@ export const adminApi = {
   // Org-admin: per-employee tracking within a workspace.
   topConsumers: (workspaceId: string) => get<{ consumers: ConsumerRow[]; window: WindowState }>(`/v1/admin/workspaces/${workspaceId}/top-consumers`),
   // User: own usage.
-  myUsage: () => get<{ windows: WindowState[] }>("/v1/me/usage"),
+  myUsage: () => get<{ windows: WindowState[]; balance?: { enforced: boolean; remaining: number | null } }>("/v1/me/usage"),
   // Super-admin: platform-wide fallback provider API keys.
   listProviderKeys: () => get<{ keys: ProviderKeyRow[] }>("/v1/admin/provider-keys"),
   addProviderKey: (provider: string, apiKey: string) =>
@@ -442,16 +449,30 @@ export function errorMessage(err: unknown, fallback: string): string {
 }
 
 // Poll an async loader every `ms` for "realtime" dashboards without websockets.
+// Stops on errors that a retry cannot fix (signed out, forbidden, endpoint missing)
+// and pauses while the tab is hidden, so an idle dashboard is not a request storm.
 // Swap for a Server-Sent Events subscription in production for sub-second updates.
 import { useEffect, useState } from "react";
 export function usePolling<T>(loader: () => Promise<T>, ms = 5000): T | null {
   const [data, setData] = useState<T | null>(null);
   useEffect(() => {
     let alive = true;
-    const tick = () => loader().then(d => { if (alive) setData(d); }).catch(() => {});
+    let id: ReturnType<typeof setInterval> | null = null;
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loader().then(d => { if (alive) setData(d); }).catch((err: unknown) => {
+        if (err instanceof SessionExpiredError) { stop(); return; }
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403 || err.status === 404)) {
+          console.warn(`[polling] ${err.status} ${err.code} — stopped`);
+          stop();
+        }
+        // Network blips and 5xx: keep polling; the next tick may succeed.
+      });
+    };
     tick();
-    const id = setInterval(tick, ms);
-    return () => { alive = false; clearInterval(id); };
+    id = setInterval(tick, ms);
+    return () => { alive = false; stop(); };
   }, [loader, ms]);
   return data;
 }

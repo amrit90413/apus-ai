@@ -59,6 +59,45 @@ public sealed class ClickHouseClient
         return await QueryAsync<UserDailyActivity>(sql, ct);
     }
 
+    /// <summary>Per-organization totals since `since` (UTC). Powers the super-admin rollup.</summary>
+    public async Task<List<OrgUsageStat>> GetOrgTotalsAsync(DateTimeOffset since, CancellationToken ct = default)
+    {
+        var sql = $"""
+            SELECT
+                toString(organization_id) AS organization_id,
+                sum(total_tokens)         AS total_tokens,
+                sum(toFloat64(cost_usd))  AS cost_usd,
+                sum(requests)             AS requests
+            FROM usage_hourly_mv
+            WHERE hour >= toDateTime('{since.UtcDateTime:yyyy-MM-dd HH:mm:ss}')
+            GROUP BY organization_id
+            FORMAT JSONEachRow
+            """;
+        return await QueryAsync<OrgUsageStat>(sql, ct);
+    }
+
+    /// <summary>Per-user totals inside one workspace over the last `minutes` (a quota window).</summary>
+    public async Task<List<UserUsageStat>> GetWorkspaceConsumersAsync(Guid workspaceId, int minutes, CancellationToken ct = default)
+    {
+        var sql = $"""
+            SELECT
+                toString(user_id)        AS user_id,
+                sum(input_tokens)        AS input_tokens,
+                sum(output_tokens)       AS output_tokens,
+                sum(toFloat64(cost_usd)) AS cost_usd,
+                sum(requests)            AS requests,
+                toString(max(hour))      AS last_active
+            FROM usage_hourly_mv
+            WHERE workspace_id = toUUID('{workspaceId}')
+              AND hour >= now() - INTERVAL {Math.Max(60, minutes)} MINUTE
+            GROUP BY user_id
+            ORDER BY input_tokens + output_tokens DESC
+            LIMIT 50
+            FORMAT JSONEachRow
+            """;
+        return await QueryAsync<UserUsageStat>(sql, ct);
+    }
+
     private async Task<List<T>> QueryAsync<T>(string sql, CancellationToken ct)
     {
         try
@@ -93,6 +132,12 @@ public sealed record UserUsageStat(
     decimal CostUsd,
     long Requests,
     string LastActive);
+
+public sealed record OrgUsageStat(
+    string OrganizationId,
+    long TotalTokens,
+    decimal CostUsd,
+    long Requests);
 
 public sealed record UserDailyActivity(
     string Day,

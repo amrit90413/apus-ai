@@ -6,6 +6,14 @@ import { authApi } from "@/lib/api";
 
 type Step = "credentials" | "otp";
 
+// Where to land after sign-in. Only same-origin paths are honoured so a crafted
+// link cannot bounce a user to another site.
+function nextPath(): string {
+  if (typeof window === "undefined") return "/";
+  const next = new URLSearchParams(window.location.search).get("next");
+  return next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("credentials");
@@ -41,7 +49,7 @@ export default function LoginPage() {
       } else {
         // Regular user — JWT returned directly
         authApi.saveToken(result);
-        router.push("/");
+        router.push(nextPath());
       }
     } catch {
       setError("Invalid email or password.");
@@ -57,7 +65,7 @@ export default function LoginPage() {
     try {
       const result = await authApi.verifyOtp(pendingToken, otp);
       authApi.saveToken(result);
-      router.push("/");
+      router.push(nextPath());
     } catch {
       setError("Incorrect or expired OTP. Try again.");
       setOtp("");
