@@ -67,7 +67,8 @@ function CreateUserModal({ workspaces, onClose, onCreated }: {
           <label htmlFor="cu-password" className="sr-only">Temporary password</label>
           <input id="cu-password" required type="password" placeholder="Temporary password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} />
           <label htmlFor="cu-phone" className="sr-only">WhatsApp number</label>
-          <input id="cu-phone" type="tel" placeholder="WhatsApp number (e.g. 919876543210)" value={phone} onChange={e => setPhone(e.target.value)} className={inputClass} />
+          <input id="cu-phone" type="tel" placeholder="WhatsApp number with country code, e.g. 919876543210" value={phone} onChange={e => setPhone(e.target.value)} className={inputClass} />
+          <p className="-mt-1 text-xs text-neutral-400">Country code first (91… for India). Required for admin roles — the login OTP is sent here.</p>
           <label htmlFor="cu-role" className="sr-only">Role</label>
           <select id="cu-role" value={role} onChange={e => setRole(e.target.value)} className={inputClass}>
             <option value="User">User</option>

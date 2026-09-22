@@ -17,7 +17,7 @@ function describeError(err: unknown, minPasswordLength: number): string {
     case "weak_password": return `Password must be at least ${minPasswordLength} characters.`;
     case "invalid_invite": return "That invite code is not valid.";
     case "phone_required": return "A phone number is required on this gateway.";
-    case "invalid_phone": return "Enter a valid phone number with country code (e.g. 919876543210).";
+    case "invalid_phone": return err.message || "Enter the full number with country code (e.g. 919876543210).";
     case "invalid_email": return "Enter a valid email address.";
     case "invalid_organization": return "Enter a valid organization name.";
     case "registration_disabled": return "Self-service signup is disabled — ask your platform administrator.";
@@ -129,7 +129,11 @@ export default function RegisterPage() {
           <div>
             <label htmlFor="reg-phone" className={labelClass}>WhatsApp number</label>
             <input id="reg-phone" type="tel" required autoComplete="tel" inputMode="numeric" value={phone}
-              onChange={e => setPhone(e.target.value)} className={inputClass} placeholder="919876543210" />
+              onChange={e => setPhone(e.target.value)} className={inputClass} placeholder="919876543210"
+              aria-describedby="reg-phone-hint" />
+            <p id="reg-phone-hint" className="mt-1 text-xs text-neutral-400">
+              Country code first, digits only — e.g. <span className="font-mono">91</span>9876543210 for India. The login code is sent here on WhatsApp.
+            </p>
             <p className="mt-1 text-xs text-neutral-400">Admin sign-in on this gateway uses a WhatsApp OTP.</p>
           </div>
         )}

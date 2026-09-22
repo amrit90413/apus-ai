@@ -60,7 +60,7 @@ public sealed partial class RegistrationController : ControllerBase
 
         var orgName = req.OrganizationName?.Trim() ?? "";
         var email = req.Email?.Trim().ToLowerInvariant() ?? "";
-        var phone = string.IsNullOrWhiteSpace(req.PhoneNumber) ? null : req.PhoneNumber.Trim();
+        var (phone, phoneError) = PhoneNumbers.Normalize(req.PhoneNumber);
 
         if (orgName.Length is < 2 or > 80)
             return Invalid("invalid_organization", "Organization name must be 2-80 characters.");
@@ -68,8 +68,8 @@ public sealed partial class RegistrationController : ControllerBase
             return Invalid("invalid_email", "Enter a valid email address.");
         if (req.Password is null || req.Password.Length < _opt.MinPasswordLength || req.Password.Length > 256)
             return Invalid("weak_password", $"Password must be at least {_opt.MinPasswordLength} characters.");
-        if (phone is not null && !PhonePattern().IsMatch(phone))
-            return Invalid("invalid_phone", "Phone must be digits in E.164 form without '+', e.g. 919876543210.");
+        if (phoneError is not null)
+            return Invalid("invalid_phone", phoneError);
         if (_whatsapp.Enabled && phone is null)
             return Invalid("phone_required", "Admin logins are verified over WhatsApp; a phone number is required.");
 
@@ -146,9 +146,6 @@ public sealed partial class RegistrationController : ControllerBase
 
     [GeneratedRegex(@"^[^\s@]+@[^\s@]+\.[^\s@]+$")]
     private static partial Regex EmailPattern();
-
-    [GeneratedRegex(@"^[1-9]\d{7,14}$")]
-    private static partial Regex PhonePattern();
 
     [GeneratedRegex(@"[^a-z0-9]+")]
     private static partial Regex NonSlug();

@@ -28,11 +28,13 @@ public sealed class AdminUsersController : ControllerBase
 {
     private readonly GatewayDbContext _db;
     private readonly ClickHouseClient _ch;
+    private readonly WhatsAppOptions _whatsapp;
 
-    public AdminUsersController(GatewayDbContext db, ClickHouseClient ch)
+    public AdminUsersController(GatewayDbContext db, ClickHouseClient ch, WhatsAppOptions whatsapp)
     {
         _db = db;
         _ch = ch;
+        _whatsapp = whatsapp;
     }
 
     private Guid OrgId => Guid.Parse(User.FindFirstValue("org_id")!);
@@ -99,6 +101,13 @@ public sealed class AdminUsersController : ControllerBase
         if (await _db.Users.AnyAsync(u => u.Email == req.Email, ct))
             return Conflict(new { error = new { code = "email_taken", message = "A user with this email already exists." } });
 
+        var (phone, phoneError) = PhoneNumbers.Normalize(req.PhoneNumber);
+        if (phoneError is not null)
+            return BadRequest(new { error = new { code = "invalid_phone", message = phoneError } });
+        // Admins log in through the WhatsApp OTP, so they cannot exist without a number.
+        if (req.Role >= Role.OrgAdmin && phone is null && _whatsapp.Enabled)
+            return BadRequest(new { error = new { code = "phone_required", message = "Admin accounts need a WhatsApp number for OTP login." } });
+
         var workspace = await _db.Workspaces.FirstOrDefaultAsync(w => w.Id == req.WorkspaceId, ct);
         if (workspace is null)
             return BadRequest(new { error = new { code = "workspace_not_found", message = "Workspace not found." } });
@@ -108,7 +117,7 @@ public sealed class AdminUsersController : ControllerBase
             OrganizationId = OrgId,
             Email = req.Email,
             PasswordHash = PasswordHasher.Hash(req.Password),
-            PhoneNumber = req.PhoneNumber,
+            PhoneNumber = phone,
             PhoneVerified = false,
             IsActive = true,
         };
@@ -146,7 +155,10 @@ public sealed class AdminUsersController : ControllerBase
 
         if (req.PhoneNumber is not null)
         {
-            user.PhoneNumber = req.PhoneNumber;
+            var (phone, phoneError) = PhoneNumbers.Normalize(req.PhoneNumber);
+            if (phoneError is not null)
+                return BadRequest(new { error = new { code = "invalid_phone", message = phoneError } });
+            user.PhoneNumber = phone;
             user.PhoneVerified = false; // re-verify after number change
         }
 
