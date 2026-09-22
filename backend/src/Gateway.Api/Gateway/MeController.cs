@@ -48,7 +48,12 @@ public sealed class MeController : ControllerBase
             windows.Add(new { name = w.Name, used, limit = w.TokenLimit, resetInSeconds = (int)(ttl?.TotalSeconds ?? w.WindowSeconds) });
         }
 
-        var balance = await _balances.GetAsync(policy.OrganizationId, new QuotaPrincipal(userId, workspaceId), ct);
+        // Credit a due allowance first, so the dashboard shows this month's balance
+        // rather than last month's remainder. Cheap when nothing is owed.
+        var principal = new QuotaPrincipal(userId, workspaceId);
+        await _balances.EnsureAllowanceAsync(policy.OrganizationId, principal, ct);
+
+        var balance = await _balances.GetAsync(policy.OrganizationId, principal, ct);
         return Ok(new { windows, balance = new { enforced = balance is not null, remaining = balance } });
     }
 
@@ -57,8 +62,11 @@ public sealed class MeController : ControllerBase
     public async Task<IActionResult> Balance(CancellationToken ct)
     {
         var (userId, workspaceId, _) = Identity();
-        var policy = await _policies.ResolveAsync(new QuotaPrincipal(userId, workspaceId), ct);
-        var balance = await _balances.GetAsync(policy.OrganizationId, new QuotaPrincipal(userId, workspaceId), ct);
+        var principal = new QuotaPrincipal(userId, workspaceId);
+        var policy = await _policies.ResolveAsync(principal, ct);
+        await _balances.EnsureAllowanceAsync(policy.OrganizationId, principal, ct);
+
+        var balance = await _balances.GetAsync(policy.OrganizationId, principal, ct);
         return Ok(new { enforced = balance is not null, remaining = balance });
     }
 

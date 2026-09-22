@@ -80,6 +80,9 @@ public sealed class GatewayDbContext : DbContext
             e.Property(x => x.WorkspaceId).HasColumnName("workspace_id");
             e.Property(x => x.Role).HasColumnName("role").HasConversion<int>();
             e.Property(x => x.PerUserQuotaJson).HasColumnName("per_user_quota_json").HasColumnType("jsonb");
+            e.Property(x => x.AllowanceTokens).HasColumnName("allowance_tokens");
+            e.Property(x => x.AllowanceRollover).HasColumnName("allowance_rollover");
+            e.Property(x => x.AllowancePeriodKey).HasColumnName("allowance_period_key");
             e.Property(x => x.TokenBalance).HasColumnName("token_balance");
             e.HasIndex(x => new { x.UserId, x.WorkspaceId }).IsUnique();
         });

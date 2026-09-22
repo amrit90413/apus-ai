@@ -118,9 +118,10 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
   const ws = user.workspaceId;
   const [balance, setBalance] = useState<BalanceResult | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [mode, setMode] = useState<"idle" | "grant" | "set">("idle");
+  const [mode, setMode] = useState<"idle" | "grant" | "set" | "allowance">("idle");
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
+  const [rollover, setRollover] = useState(false);
   // Minted when the grant form opens and reused until a grant succeeds, so a
   // retried or double-submitted request can't add the tokens twice.
   const [idempotencyKey, setIdempotencyKey] = useState<string>("");
@@ -138,9 +139,11 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
 
   useEffect(() => { void load(); }, [load]);
 
-  const openForm = (m: "grant" | "set") => {
+  const openForm = (m: "grant" | "set" | "allowance") => {
     setMode(m);
-    setAmount("");
+    // Editing an allowance starts from the current one; the others start empty.
+    setAmount(m === "allowance" && balance?.allowance ? String(balance.allowance.tokens) : "");
+    setRollover(m === "allowance" ? (balance?.allowance?.rollover ?? false) : false);
     setNote("");
     setError(null);
     if (m === "grant") setIdempotencyKey(crypto.randomUUID());
@@ -148,9 +151,10 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const tokens = parseTokens(amount, mode === "grant" ? 1 : 0);
+    const min = mode === "set" ? 0 : 1;
+    const tokens = parseTokens(amount, min);
     if (tokens === null) {
-      setError(mode === "grant" ? "Enter a whole number of tokens greater than zero." : "Enter a whole number of tokens (0 or more).");
+      setError(min === 1 ? "Enter a whole number of tokens greater than zero." : "Enter a whole number of tokens (0 or more).");
       return;
     }
     setBusy(true);
@@ -158,12 +162,29 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
     try {
       const next = mode === "grant"
         ? await adminApi.grantTokens(user.id, { tokens, note: note.trim() || undefined, idempotencyKey }, ws)
+        : mode === "allowance"
+        ? await adminApi.setAllowance(user.id, { tokens, rollover, note: note.trim() || undefined }, ws)
         : await adminApi.setTokens(user.id, { tokens, note: note.trim() || undefined }, ws);
       setBalance(next);
       setMode("idle");
       onChanged();
     } catch (err) {
       setError(errorMessage(err, "The change was not saved."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopAllowance = async () => {
+    if (!confirm(`Stop the monthly allowance for ${user.email}? Tokens already credited stay; there will be no further top-ups.`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setBalance(await adminApi.clearAllowance(user.id, ws));
+      setMode("idle");
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err, "Could not stop the allowance."));
     } finally {
       setBusy(false);
     }
@@ -202,10 +223,22 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
             <span className="text-xs text-neutral-400">
               {balance.enforced ? "prepaid balance enforced" : "rolling windows only"}
             </span>
+            {balance.allowance && (
+              <span className="rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                +{balance.allowance.tokens.toLocaleString()}/month
+                {balance.allowance.rollover ? " · rolls over" : " · resets"}
+              </span>
+            )}
           </div>
           <div className="mb-3 flex flex-wrap gap-2">
             <button type="button" onClick={() => openForm("grant")} disabled={busy} className={secondaryBtn}>Add tokens</button>
             <button type="button" onClick={() => openForm("set")} disabled={busy} className={secondaryBtn}>Set balance</button>
+            <button type="button" onClick={() => openForm("allowance")} disabled={busy} className={secondaryBtn}>
+              {balance.allowance ? "Edit monthly allowance" : "Monthly allowance"}
+            </button>
+            {balance.allowance && (
+              <button type="button" onClick={stopAllowance} disabled={busy} className={`${secondaryBtn} text-red-600`}>Stop allowance</button>
+            )}
             {balance.enforced && (
               <button type="button" onClick={makeUnlimited} disabled={busy} className={`${secondaryBtn} text-red-600`}>Make unlimited</button>
             )}
@@ -215,9 +248,9 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
               <div className="flex flex-col gap-2 sm:flex-row">
                 <div className="sm:w-40">
                   <label htmlFor="bal-amount" className="mb-1 block text-xs text-neutral-500">
-                    {mode === "grant" ? "Tokens to add" : "New balance"}
+                    {mode === "grant" ? "Tokens to add" : mode === "allowance" ? "Tokens per month" : "New balance"}
                   </label>
-                  <input id="bal-amount" type="number" min={mode === "grant" ? 1 : 0} step={1} required autoFocus
+                  <input id="bal-amount" type="number" min={mode === "set" ? 0 : 1} step={1} required autoFocus
                     value={amount} onChange={e => setAmount(e.target.value)} className={inputClass} placeholder="1000000" />
                 </div>
                 <div className="flex-1">
@@ -226,10 +259,24 @@ function BalanceSection({ user, onChanged }: { user: UserRow; onChanged: () => v
                     className={inputClass} placeholder="e.g. Q4 allocation" />
                 </div>
               </div>
+              {mode === "allowance" && (
+                <>
+                  <label className="mt-2 flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400">
+                    <input type="checkbox" checked={rollover} onChange={e => setRollover(e.target.checked)} />
+                    Unused tokens roll over to next month
+                  </label>
+                  <p className="mt-1 text-xs text-neutral-400">
+                    Credited now and on the 1st of each month (UTC).
+                    {rollover
+                      ? " Leftover tokens are kept, so an unused month accumulates."
+                      : " The balance resets to this amount, so unused tokens are lost."}
+                  </p>
+                </>
+              )}
               {error && <p className="mt-2 text-xs text-red-600" role="alert">{error}</p>}
               <div className="mt-2 flex gap-2">
                 <button type="submit" disabled={busy} className={primaryBtn}>
-                  {busy ? "Saving…" : mode === "grant" ? "Add tokens" : "Set balance"}
+                  {busy ? "Saving…" : mode === "grant" ? "Add tokens" : mode === "allowance" ? "Save allowance" : "Set balance"}
                 </button>
                 <button type="button" onClick={() => setMode("idle")} disabled={busy} className={secondaryBtn}>Cancel</button>
               </div>

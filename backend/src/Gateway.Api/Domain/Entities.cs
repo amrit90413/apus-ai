@@ -56,6 +56,18 @@ public sealed class Membership
     /// change is mirrored by a TokenLedgerEntry row.
     /// </summary>
     public long? TokenBalance { get; set; }
+
+    /// <summary>
+    /// Tokens credited to TokenBalance once per calendar month (UTC). Null = no
+    /// recurring allowance; a one-off balance an admin set still applies.
+    /// </summary>
+    public long? AllowanceTokens { get; set; }
+
+    /// <summary>true: add to what is left. false: reset the balance to AllowanceTokens.</summary>
+    public bool AllowanceRollover { get; set; }
+
+    /// <summary>Last period credited, "yyyy-MM". Null = never credited.</summary>
+    public string? AllowancePeriodKey { get; set; }
 }
 
 /// <summary>A CLI/device session bound to a refresh token + device fingerprint.</summary>
@@ -123,7 +135,7 @@ public sealed class ProviderCredential
     public string? LastError { get; set; }
 }
 
-public enum LedgerKind { Grant = 0, Set = 1, Usage = 2, Revoke = 3 }
+public enum LedgerKind { Grant = 0, Set = 1, Usage = 2, Revoke = 3, Allowance = 4 }
 
 /// <summary>
 /// Immutable history of every token-balance change. Corrections are new rows, never

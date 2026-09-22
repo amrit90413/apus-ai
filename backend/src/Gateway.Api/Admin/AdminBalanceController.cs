@@ -10,6 +10,7 @@ namespace Gateway.Api.Admin;
 
 public sealed record GrantTokensRequest(long Tokens, string? Note, string? IdempotencyKey);
 public sealed record SetTokensRequest(long Tokens, string? Note);
+public sealed record SetAllowanceRequest(long Tokens, bool Rollover, string? Note);
 
 /// <summary>
 /// Prepaid token allowances per (user, workspace). Grant adds to the balance (and
@@ -90,6 +91,45 @@ public sealed class AdminBalanceController : ControllerBase
         return Ok(Shape(membership, balance, new[] { entry }));
     }
 
+    // PUT /api/v1/admin/users/{id}/balance/allowance
+    // Start or change a recurring monthly allowance; credits the current period now.
+    [HttpPut("allowance")]
+    public async Task<IActionResult> SetAllowance(Guid id, [FromQuery] Guid? workspaceId, [FromBody] SetAllowanceRequest req, CancellationToken ct)
+    {
+        if (req.Tokens is <= 0 or > MaxTokens)
+            return Invalid("tokens must be between 1 and 1,000,000,000,000.", "invalid_tokens");
+        if (Validate(req.Note, null) is { } bad) return bad;
+
+        var (membership, error) = await MembershipLookup.ResolveAsync(_db, id, workspaceId, ct);
+        if (error is not null) return error;
+
+        var (balance, entry) = await _balances.SetAllowanceAsync(
+            OrgId, membership!, req.Tokens, req.Rollover, ActorId, req.Note, ct);
+        await Audit("allowance_set",
+            $"targetUser={id} workspace={membership!.WorkspaceId} tokens={req.Tokens} rollover={req.Rollover}", ct);
+
+        // Re-read so the response reflects the allowance columns the service wrote.
+        var (fresh, _) = await MembershipLookup.ResolveAsync(_db, id, membership.WorkspaceId, ct);
+        var history = await _balances.HistoryAsync(OrgId, membership.Id, 50, ct);
+        return Ok(Shape(fresh ?? membership, balance, history));
+    }
+
+    // DELETE /api/v1/admin/users/{id}/balance/allowance
+    // Stop future renewals. Tokens already credited stay.
+    [HttpDelete("allowance")]
+    public async Task<IActionResult> ClearAllowance(Guid id, [FromQuery] Guid? workspaceId, CancellationToken ct)
+    {
+        var (membership, error) = await MembershipLookup.ResolveAsync(_db, id, workspaceId, ct);
+        if (error is not null) return error;
+
+        await _balances.ClearAllowanceAsync(OrgId, membership!, ct);
+        await Audit("allowance_cleared", $"targetUser={id} workspace={membership!.WorkspaceId}", ct);
+
+        var (fresh, _) = await MembershipLookup.ResolveAsync(_db, id, membership.WorkspaceId, ct);
+        var history = await _balances.HistoryAsync(OrgId, membership.Id, 50, ct);
+        return Ok(Shape(fresh ?? membership, (fresh ?? membership).TokenBalance, history));
+    }
+
     private static object Shape(Membership m, long? balance, IReadOnlyList<LedgerRow> history) => new
     {
         userId = m.UserId,
@@ -97,6 +137,13 @@ public sealed class AdminBalanceController : ControllerBase
         membershipId = m.Id,
         enforced = balance is not null,
         balance,
+        allowance = m.AllowanceTokens is null ? null : new
+        {
+            tokens = m.AllowanceTokens,
+            rollover = m.AllowanceRollover,
+            period = "monthly",
+            lastCreditedPeriod = m.AllowancePeriodKey
+        },
         history
     };
 

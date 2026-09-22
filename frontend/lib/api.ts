@@ -303,7 +303,7 @@ export interface OAuthFinishResult { id: string; expiresAt: string | null; }
 export interface CredentialTestResult { ok: boolean; message: string; }
 
 // Prepaid token balance + ledger.
-export type LedgerKind = "grant" | "set" | "usage" | "revoke";
+export type LedgerKind = "grant" | "set" | "usage" | "revoke" | "allowance";
 export interface LedgerEntry {
   id: number;
   kind: LedgerKind;
@@ -313,12 +313,21 @@ export interface LedgerEntry {
   reference: string | null;
   createdAt: string;
 }
+/** Recurring top-up. Null on BalanceResult when the user has no allowance. */
+export interface Allowance {
+  tokens: number;
+  rollover: boolean;
+  period: "monthly";
+  /** Last period credited, "YYYY-MM"; null before the first credit. */
+  lastCreditedPeriod: string | null;
+}
 export interface BalanceResult {
   userId: string;
   workspaceId: string;
   membershipId: string;
   enforced: boolean;
   balance: number | null;
+  allowance: Allowance | null;
   history: LedgerEntry[];
 }
 
@@ -421,6 +430,11 @@ export const adminApi = {
     put<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`, body),
   revokeBalance: (id: string, workspaceId?: string) =>
     delJson<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`),
+  // Recurring monthly allowance: credits the current period immediately, then renews.
+  setAllowance: (id: string, body: { tokens: number; rollover: boolean; note?: string }, workspaceId?: string) =>
+    put<BalanceResult>(`/v1/admin/users/${id}/balance/allowance${wsQuery(workspaceId)}`, body),
+  clearAllowance: (id: string, workspaceId?: string) =>
+    delJson<BalanceResult>(`/v1/admin/users/${id}/balance/allowance${wsQuery(workspaceId)}`),
 
   // Org-admin: per-user model allowlist (override of the workspace policy).
   getUserQuota: (id: string, workspaceId?: string) =>

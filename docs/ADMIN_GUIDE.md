@@ -165,7 +165,9 @@ never refills on its own.
 | Grant | `POST /api/v1/admin/users/{id}/balance/grant` `{ tokens>0, note?, idempotencyKey? }` | Adds to the balance. If the user was unlimited, enforcement starts at `tokens`. | `grant`, `delta = +tokens` |
 | Set | `PUT /api/v1/admin/users/{id}/balance` `{ tokens>=0, note? }` | Overwrites the balance (0 blocks the user until the next grant). | `set`, `delta = tokens - previous` |
 | Unlimited | `DELETE /api/v1/admin/users/{id}/balance` | Back to `null`. Windows still apply. | `revoke`, `delta = -previous` |
-| Inspect | `GET /api/v1/admin/users/{id}/balance?limit=50` | Balance + history (up to 200 rows). | — |
+| Allowance | `PUT /api/v1/admin/users/{id}/balance/allowance` `{ tokens>0, rollover, note? }` | Recurring monthly top-up; credits the current period immediately. | `allowance`, `delta = new - previous` |
+| Stop allowance | `DELETE /api/v1/admin/users/{id}/balance/allowance` | No further renewals. Tokens already credited stay. | — |
+| Inspect | `GET /api/v1/admin/users/{id}/balance?limit=50` | Balance + allowance + history (up to 200 rows). | — |
 
 ```bash
 curl -s -X POST "https://ai.example.com/api/v1/admin/users/<user-id>/balance/grant" \
@@ -180,6 +182,45 @@ endpoint refuses to guess (400 `workspace_required`). Grants are capped at
 10<sup>12</sup> tokens per call and notes at 256 characters. An `idempotencyKey`
 is unique per organization: replaying the same grant returns the original ledger
 row instead of adding tokens twice — use it from scripts and retries.
+
+### Monthly allowance
+
+A one-off grant does not refill. An **allowance** does: set one and the balance is
+topped up once per calendar month (UTC), which is how you give each employee a
+fixed monthly budget without re-granting by hand.
+
+```bash
+curl -s -X PUT "https://ai.example.com/api/v1/admin/users/<user-id>/balance/allowance" \
+  -H "authorization: Bearer $JWT" -H 'content-type: application/json' \
+  -d '{"tokens":500000,"rollover":false,"note":"standard seat"}'
+# -> { ..., balance: 500000,
+#      allowance: { tokens: 500000, rollover: false, period: "monthly", lastCreditedPeriod: "2026-09" } }
+```
+
+`rollover` decides what happens to what is left:
+
+| `rollover` | Behaviour | Use when |
+| --- | --- | --- |
+| `false` (default) | Balance **resets** to the allowance each month. Unused tokens are lost. | You want a hard, predictable ceiling per person per month. |
+| `true` | The allowance is **added** to what is left, so an unused month accumulates. | Usage is bursty and you don't want to penalise a quiet month. |
+
+Notes on behaviour:
+
+- **The top-up is applied lazily**, on the first request or dashboard load in a new
+  month — not by a scheduler. The gateway is stateless and horizontally scaled, so
+  a timer would need leader election and a missed run would strand users. A user who
+  does not log in for a month is credited the moment they return; they never miss a
+  period, but they also never accumulate more than one unless `rollover` is on.
+- **Concurrency is safe.** The credit runs under a `SELECT … FOR UPDATE` on the
+  membership row and carries the idempotency key `allowance:{membershipId}:{YYYY-MM}`,
+  so simultaneous requests across replicas cannot double-credit.
+- **Editing the amount mid-month re-credits immediately** with the new figure, so
+  raising someone's allowance takes effect at once rather than next month.
+- Setting an allowance on an unlimited user starts enforcement. Stopping the
+  allowance leaves the remaining balance in place and still enforced — use
+  `DELETE .../balance` to return them to unlimited.
+- Every credit is an `allowance` ledger row with `actorUserId` null for automatic
+  renewals and the admin's id when they set or changed it.
 
 ### How a request is charged
 

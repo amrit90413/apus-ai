@@ -4,6 +4,7 @@ using Gateway.Api.Domain;
 using Gateway.Api.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace Gateway.Api.Quota;
 
@@ -33,6 +34,20 @@ public interface ITokenBalanceService
     Task<(long? balance, LedgerRow entry)> RevokeAsync(Guid organizationId, Membership membership, Guid actorId, string? note, CancellationToken ct);
 
     Task<IReadOnlyList<LedgerRow>> HistoryAsync(Guid organizationId, Guid membershipId, int limit, CancellationToken ct);
+
+    /// <summary>
+    /// Credits this period's allowance if it is due. Called on the hot path; cheap
+    /// when nothing is owed. Never throws into the caller — a failed top-up is logged
+    /// and retried on a later request rather than failing the user's request.
+    /// </summary>
+    Task EnsureAllowanceAsync(Guid organizationId, QuotaPrincipal p, CancellationToken ct);
+
+    /// <summary>Start or change a recurring allowance and credit the current period immediately.</summary>
+    Task<(long? balance, LedgerRow? entry)> SetAllowanceAsync(
+        Guid organizationId, Membership membership, long tokens, bool rollover, Guid actorId, string? note, CancellationToken ct);
+
+    /// <summary>Stop the recurring allowance. Whatever balance is left stays.</summary>
+    Task ClearAllowanceAsync(Guid organizationId, Membership membership, CancellationToken ct);
 }
 
 /// <summary>
@@ -45,11 +60,17 @@ public interface ITokenBalanceService
 public sealed class TokenBalanceService : ITokenBalanceService
 {
     private readonly GatewayDbContext _db;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<TokenBalanceService> _log;
 
-    public TokenBalanceService(GatewayDbContext db, ILogger<TokenBalanceService> log)
+    /// <summary>How long a pod trusts "nothing owed" before re-checking.</summary>
+    private static readonly TimeSpan CheckedTtl = TimeSpan.FromMinutes(15);
+    /// <summary>Backoff after a failed top-up, so a persistent fault cannot hammer the database.</summary>
+    private static readonly TimeSpan FailedTtl = TimeSpan.FromMinutes(1);
+
+    public TokenBalanceService(GatewayDbContext db, IMemoryCache cache, ILogger<TokenBalanceService> log)
     {
-        _db = db; _log = log;
+        _db = db; _cache = cache; _log = log;
     }
 
     // ------------------------------------------------------------------ hot path
@@ -57,6 +78,10 @@ public sealed class TokenBalanceService : ITokenBalanceService
     public async Task<BalanceReservation> ReserveAsync(Guid organizationId, QuotaPrincipal p, long estimate, CancellationToken ct)
     {
         if (estimate < 0) throw new ArgumentOutOfRangeException(nameof(estimate));
+
+        // Credit a due allowance before reading the balance, so a user whose month
+        // just rolled over is not blocked on last month's exhausted balance.
+        await EnsureAllowanceAsync(organizationId, p, ct);
 
         // NULL - estimate stays NULL, so an unenforced membership still matches and
         // returns one row with a NULL balance. An insufficient balance matches nothing.
@@ -206,6 +231,137 @@ public sealed class TokenBalanceService : ITokenBalanceService
             .ToListAsync(ct);
     }
 
+    // ---------------------------------------------------------------- allowance
+
+    /// <summary>Calendar month in UTC, e.g. "2026-09". The unit an allowance renews on.</summary>
+    internal static string CurrentPeriodKey(DateTimeOffset? now = null) =>
+        (now ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("yyyy-MM");
+
+    public async Task EnsureAllowanceAsync(Guid organizationId, QuotaPrincipal p, CancellationToken ct)
+    {
+        var period = CurrentPeriodKey();
+        var cacheKey = $"allowance:{organizationId}:{p.UserId}:{p.WorkspaceId}:{period}";
+        if (_cache.TryGetValue(cacheKey, out _)) return;
+
+        // Cheap indexed read first — the transaction below is only worth opening
+        // when a top-up is actually owed, which is at most once per user per month.
+        var row = await _db.Memberships.AsNoTracking()
+            .Where(m => m.OrganizationId == organizationId && m.UserId == p.UserId && m.WorkspaceId == p.WorkspaceId)
+            .Select(m => new { m.Id, m.AllowanceTokens, m.AllowancePeriodKey })
+            .FirstOrDefaultAsync(ct);
+
+        if (row is null || row.AllowanceTokens is null || row.AllowancePeriodKey == period)
+        {
+            _cache.Set(cacheKey, true, CheckedTtl);
+            return;
+        }
+
+        try
+        {
+            await ApplyAllowanceAsync(organizationId, row.Id, period, ct);
+            _cache.Set(cacheKey, true, CheckedTtl);
+        }
+        catch (Exception ex)
+        {
+            // Includes the unique-index violation when another replica won the race,
+            // which is a success from the user's point of view. Never fail the request.
+            _log.LogWarning(ex, "Allowance top-up deferred for membership {Membership} period {Period}", row.Id, period);
+            _cache.Set(cacheKey, true, FailedTtl);
+        }
+    }
+
+    /// <summary>Credits one period under the membership row lock. Idempotent per (membership, period).</summary>
+    private async Task ApplyAllowanceAsync(Guid organizationId, Guid membershipId, string period, CancellationToken ct)
+    {
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var locked = await LockAsync(organizationId, membershipId, ct);
+
+        // Re-check under the lock: a concurrent replica may have credited it already.
+        if (locked.AllowanceTokens is null || locked.AllowancePeriodKey == period)
+        {
+            await tx.CommitAsync(ct);
+            return;
+        }
+
+        var entry = CreditAllowance(organizationId, locked, period, actorId: null, note: null);
+        _db.TokenLedger.Add(entry);
+        await _db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        _log.LogInformation("Allowance credited: membership {Membership} period {Period} balance {Balance}",
+            locked.Id, period, locked.TokenBalance);
+    }
+
+    /// <summary>Applies the period credit to a locked membership and builds its ledger row.</summary>
+    private static TokenLedgerEntry CreditAllowance(Guid organizationId, Membership locked, string period, Guid? actorId, string? note)
+    {
+        var before = locked.TokenBalance;
+        var tokens = locked.AllowanceTokens!.Value;
+        // Rollover adds to what is left; otherwise the period starts fresh, so an
+        // unused month does not accumulate into an unbounded balance.
+        var after = locked.AllowanceRollover ? checked((before ?? 0) + tokens) : tokens;
+
+        locked.TokenBalance = after;
+        locked.AllowancePeriodKey = period;
+
+        return new TokenLedgerEntry
+        {
+            OrganizationId = organizationId,
+            MembershipId = locked.Id,
+            UserId = locked.UserId,
+            WorkspaceId = locked.WorkspaceId,
+            Kind = LedgerKind.Allowance,
+            Delta = after - (before ?? 0),
+            BalanceAfter = after,
+            ActorUserId = actorId,
+            Reference = string.IsNullOrWhiteSpace(note) ? $"allowance {period}" : note.Trim(),
+            IdempotencyKey = $"allowance:{locked.Id}:{period}",
+        };
+    }
+
+    public async Task<(long? balance, LedgerRow? entry)> SetAllowanceAsync(
+        Guid organizationId, Membership membership, long tokens, bool rollover, Guid actorId, string? note, CancellationToken ct)
+    {
+        if (tokens <= 0) throw new ArgumentOutOfRangeException(nameof(tokens), "Allowance must be positive.");
+
+        var period = CurrentPeriodKey();
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var locked = await LockAsync(organizationId, membership.Id, ct);
+
+        locked.AllowanceTokens = tokens;
+        locked.AllowanceRollover = rollover;
+
+        // Credit the current period now: an admin setting an allowance expects it to
+        // take effect immediately, not at the start of next month. Re-crediting a
+        // period already credited is deliberate — the admin changed the amount.
+        locked.AllowancePeriodKey = null;
+        var entry = CreditAllowance(organizationId, locked, period, actorId, note);
+
+        // A period may be credited twice if the admin edits the amount mid-month, so
+        // this row cannot claim the per-period idempotency key.
+        entry.IdempotencyKey = null;
+        _db.TokenLedger.Add(entry);
+        await _db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        _cache.Remove($"allowance:{organizationId}:{locked.UserId}:{locked.WorkspaceId}:{period}");
+        return (locked.TokenBalance, ToRow(entry));
+    }
+
+    public async Task ClearAllowanceAsync(Guid organizationId, Membership membership, CancellationToken ct)
+    {
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var locked = await LockAsync(organizationId, membership.Id, ct);
+
+        // The balance already credited stays; only future renewals stop.
+        locked.AllowanceTokens = null;
+        locked.AllowancePeriodKey = null;
+        await _db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        _cache.Remove($"allowance:{organizationId}:{locked.UserId}:{locked.WorkspaceId}:{CurrentPeriodKey()}");
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /// <summary>Row lock for the admin write path. Must run inside a transaction.</summary>
@@ -213,7 +369,8 @@ public sealed class TokenBalanceService : ITokenBalanceService
     {
         var row = await _db.Memberships
             .FromSqlInterpolated($"""
-                SELECT id, organization_id, user_id, workspace_id, role, per_user_quota_json, token_balance
+                SELECT id, organization_id, user_id, workspace_id, role, per_user_quota_json, token_balance,
+                       allowance_tokens, allowance_rollover, allowance_period_key
                   FROM memberships
                  WHERE id = {membershipId} AND organization_id = {organizationId}
                  FOR UPDATE
