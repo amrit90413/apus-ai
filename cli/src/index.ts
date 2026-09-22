@@ -5,6 +5,7 @@ import { chat } from "./commands/chat.js";
 import { usage, sessions, models } from "./commands/usage.js";
 import { setup } from "./commands/setup.js";
 import { keysList, keysRevoke } from "./commands/keys.js";
+import { providersList, providersTest } from "./commands/providers.js";
 
 // Gateway URL resolves from flag → env → default. `APUS_AI_API` is the env var;
 // `YOURCOMPANY_AI_API` is still honoured for installs configured before the rename.
@@ -66,11 +67,18 @@ program.command("chat").description("Interactive AI chat (streamed through the g
   .option("-p, --prompt <text>", "One-shot prompt (non-interactive)")
   .action((o) => chat({ model: o.model, once: o.prompt }));
 
-program.command("usage").description("Show your quota windows and prepaid balance")
+program.command("usage").description("Show your monthly allowance, quota windows and prepaid balance")
   .action(() => usage());
 
-program.command("models").description("List models your admin has allocated to you")
+program.command("models").description("List the models you can use and which provider serves each")
   .action(() => models());
+
+const providers = program.command("providers")
+  .description("Admin: the AI providers your organization has connected");
+providers.command("list", { isDefault: true }).description("Show every provider, its connection state and this month's spend")
+  .action(() => providersList());
+providers.command("test <connectionId>").description("Run the connection test against a provider (see `providers list`)")
+  .action((id: string) => providersTest(id));
 
 program.command("sessions").description("List your active device sessions")
   .action(() => sessions());

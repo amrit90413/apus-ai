@@ -86,7 +86,13 @@ builder.Services.AddSingleton<IPolicyCache, PolicyCache>();
 builder.Services.AddScoped<IQuotaPolicyResolver, QuotaPolicyResolver>();
 
 // ---- RabbitMQ publisher (singleton, channel reused) ----
-var rabbit = await RabbitMqUsagePublisher.CreateAsync(builder.Configuration.GetConnectionString("RabbitMq")!);
+// Connects lazily and keeps retrying: usage analytics must not be able to stop the
+// gateway from starting. Accounting does not depend on it — the usage ledger is
+// written to Postgres on the request path.
+var rabbitLogger = LoggerFactory.Create(b => b.AddSerilog()).CreateLogger<ResilientUsageEventPublisher>();
+var rabbit = await ResilientUsageEventPublisher.CreateAsync(
+    builder.Configuration.GetConnectionString("RabbitMq")!, rabbitLogger);
+builder.Services.AddSingleton(rabbit);
 builder.Services.AddSingleton<IUsageEventPublisher>(rabbit);
 
 // ---- Ollama (free local provider, no API key needed) ----
@@ -178,7 +184,16 @@ builder.Services.AddHttpClient<ClickHouseClient>()
     .ConfigureHttpClient(c => c.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.AddScoped<ClickHouseClient>();
 
-builder.Services.AddControllers();
+builder.Services.AddControllers()
+    .AddJsonOptions(o =>
+    {
+        // The dashboard sends role names ("WorkspaceAdmin"), not ordinals. Without
+        // this the API answered 400 and creating or re-roling a user from the UI
+        // simply did not work. Numbers are still accepted, so existing API clients
+        // and stored payloads are unaffected.
+        o.JsonSerializerOptions.Converters.Add(
+            new System.Text.Json.Serialization.JsonStringEnumConverter(allowIntegerValues: true));
+    });
 
 // ---- Observability: OpenTelemetry traces + Prometheus metrics ----
 builder.Services.AddOpenTelemetry()
@@ -191,7 +206,12 @@ builder.Services.AddOpenTelemetry()
 // ---- Health checks (liveness/readiness for K8s) ----
 builder.Services.AddHealthChecks()
     .AddNpgSql(builder.Configuration.GetConnectionString("Postgres")!, name: "postgres")
-    .AddRedis(builder.Configuration.GetConnectionString("Redis")!, name: "redis");
+    .AddRedis(builder.Configuration.GetConnectionString("Redis")!, name: "redis")
+    // Degraded, not unhealthy: a broker outage costs analytics, not correctness, so
+    // it must not take the pod out of the load balancer.
+    .AddCheck("rabbitmq", () => rabbit.IsConnected
+        ? HealthCheckResult.Healthy()
+        : HealthCheckResult.Degraded($"usage analytics paused; {rabbit.DroppedEvents} event(s) dropped"));
 
 // ---- First-admin bootstrap (no-op once any user exists) ----
 var bootstrapOpt = builder.Configuration.GetSection("Bootstrap").Get<BootstrapOptions>() ?? new BootstrapOptions();
