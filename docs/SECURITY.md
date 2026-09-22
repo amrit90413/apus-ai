@@ -104,3 +104,89 @@ caller can forge its source address and bypass the per-IP limiter.
   anomalies (see `docs/ADMIN_GUIDE.md` for the action list).
 - Personal keys and OAuth `state` values are generated with
   `RandomNumberGenerator`; nothing security-relevant uses `System.Random`.
+
+---
+
+## Provider connections
+
+### Secrets at rest
+
+Every provider secret is AES-256-GCM sealed with a random 96-bit nonce under a
+**versioned** data key, and the version is stored on the row. Rotation is therefore an
+operational change, not an outage: add the new key, point `Encryption:CurrentKeyVersion`
+at it, and `CredentialRotationWorker` re-seals rows in the background while old rows keep
+decrypting under the key that wrote them. Retire the old key once nothing reports the old
+version.
+
+Data keys come from `IDataKeyProvider`. The shipped implementation reads them from
+configuration, which in production is a Kubernetes secret / Secrets Manager / Key Vault
+projection — the master key is never in the database. A KMS-backed envelope scheme means
+implementing that one interface; nothing else changes.
+
+A secret that cannot be decrypted (a retired key, a tampered row) is **refused and
+logged, never served**. Verified in the live run: the gateway answered
+`PROVIDER_NOT_CONNECTED` with an admin-facing log line rather than passing garbage
+upstream.
+
+### Where secrets are not
+
+Plaintext exists only in a local variable for the duration of one call. It is not in any
+API response (only a hint — last four characters, an AWS access key id, or a
+service-account email), not in browser storage, not in a URL, not in logs, and not in
+exception messages. Audit `before`/`after` payloads are scrubbed on the way in: any field
+whose name looks like a secret is replaced before the record is written.
+
+Upstream error bodies are **not relayed verbatim** on a credential failure — provider
+errors name accounts, organization ids and key fragments. They are translated to the
+Anthropic error shape with a generic message.
+
+### OAuth
+
+- PKCE (S256) on every flow; only the challenge leaves the gateway.
+- State is generated server-side, held in Redis for 10 minutes, and consumed with
+  `GETDEL` — a replayed callback cannot exchange twice.
+- A browser-bound flow cookie (HttpOnly, SameSite=Lax, Secure over HTTPS) is required by
+  the redirect callback. Without it a callback forged elsewhere could attach an
+  attacker's provider account to the tenant; with it, that is refused as `flow_mismatch`.
+  The SPA variant requires the admin's own session and matches the originating actor.
+- Authorize/token URLs come from operator configuration only. A tenant can never supply
+  them, which would otherwise point the gateway's OAuth flow at an endpoint they control.
+- The completion redirect is built from the configured redirect URI's own origin plus a
+  relative path, so it cannot become an open redirect.
+- Refresh runs under a Redis lock so replicas cannot refresh the same grant concurrently;
+  a rotated refresh token is written in the same save as the new access token.
+
+### SSRF
+
+Each provider descriptor carries an allowlist of host suffixes. A configured base URL
+must be `https` and land on an allowed host, so a tenant-supplied endpoint cannot aim the
+gateway — and its credentials — at `169.254.169.254`, an internal service, or a
+lookalike domain. Region, project and location values are restricted to `[A-Za-z0-9_-]`
+so they cannot inject a path segment.
+
+### Tenant isolation
+
+Enforced at the repository boundary by EF global query filters, not in controllers, so a
+missing `WHERE` cannot leak. Integration tests deliberately attempt cross-tenant reads,
+writes and aggregates with valid ids from another tenant, and assert they resolve to
+nothing.
+
+### Authorization
+
+Endpoints authorize on named permissions via a policy provider that builds policies on
+demand; an unknown permission yields no policy and the request is refused. The dashboard
+hiding a button is a courtesy, never a control.
+
+### Money
+
+Financial amounts are integer minor units end to end — no floating point anywhere in
+allowances, costs or the ledger. Allowance reservation is a single conditional `UPDATE`,
+so concurrent requests cannot collectively overspend a budget; a test admits exactly ten
+of fifty concurrent requests against a ₹100 budget. Historical ledger rows are never
+mutated; corrections are adjustment rows.
+
+### Response headers
+
+Every response carries `Content-Security-Policy: default-src 'none'; frame-ancestors
+'none'`, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy:
+no-referrer`, COOP/CORP and a `Permissions-Policy`. HSTS is added over HTTPS.

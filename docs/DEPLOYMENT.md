@@ -426,3 +426,121 @@ Migrations are not auto-reverted — roll schema changes forward.
 - [ ] Web login route that sets an httpOnly cookie for the dashboard
 - [ ] Billing consumer on the `usage.billing` queue (declared and bound already)
 - [ ] Anomaly detector over audit logs / session IPs
+
+---
+
+## Upgrading to multi-provider connections and allowances (migration 003)
+
+### Apply
+
+```bash
+psql "$POSTGRES_URL" -f infra/db/migrations/003_provider_connections_and_allowances.sql
+```
+
+Idempotent and backward compatible: every column is added nullable or with a default,
+nothing is dropped or retyped, and a gateway running the previous build keeps working
+against the upgraded schema (the new columns simply read as their defaults). Apply it
+**before** rolling the new image, so the deploy is a normal rolling update.
+
+CI proves this on every push: a job builds the schema fresh, builds it again by applying
+003 to the previous schema, and runs 003 a second time.
+
+### The one data change
+
+Where an organization has several *active* credentials for the same provider, all but
+the newest are marked `disabled`. Credential resolution has always picked the newest row
+(`ORDER BY created_at DESC`), so the others were already dead weight; this makes it
+explicit and lets the one-live-connection unique index exist. Check first if you want to
+see what will move:
+
+```sql
+SELECT organization_id, provider, count(*)
+  FROM provider_credentials WHERE is_active
+ GROUP BY 1, 2 HAVING count(*) > 1;
+```
+
+### Rollback
+
+Redeploy the previous image. No schema rollback is required — the old build ignores the
+new columns and tables. If you must reverse the schema, the destructive step is the
+unique index and the new tables:
+
+```sql
+DROP INDEX IF EXISTS ux_provider_connections_live;
+DROP TABLE IF EXISTS ai_usage_ledger, allowance_periods, notification_outbox, provider_model_pricing;
+-- The added columns are harmless; leave them unless you have a reason.
+```
+
+Connections disabled by the collapse step stay disabled. Note that rolling back after
+traffic has run loses the allowance and cost history recorded since the upgrade — the
+token ledger and ClickHouse analytics are unaffected.
+
+### Configure
+
+Minimum for the new features:
+
+```bash
+# Tenants are billed in their own currency; provider list prices are USD.
+BILLING_DEFAULT_CURRENCY=INR
+BILLING_USD_RATE_INR=83
+BILLING_DEFAULT_MARKUP_BPS=0
+
+# A dedicated at-rest key (this was already recommended; it is now load-bearing).
+DATA_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+Browser login is optional — see [PROVIDERS.md](PROVIDERS.md) for the client settings and
+the exact redirect URI to register.
+
+### Roll out
+
+Flags are off, on, or on for a named list of organization ids:
+
+```bash
+Features__Flags__AI_PROVIDER_FALLBACK__Enabled=false
+Features__Flags__AI_PROVIDER_FALLBACK__Organizations__0=<pilot-org-id>
+```
+
+Defaults: connections, OAuth, child allowances and usage billing on; provider fallback
+off. Enable fallback per tenant once your model equivalences are agreed — it must respect
+the member's model permissions, the tenant's provider permissions and data-residency
+constraints, and every fallback is recorded in the usage ledger.
+
+### Verify
+
+```bash
+# Prices seeded on first start
+psql "$POSTGRES_URL" -c "select count(*) from provider_model_pricing"
+
+# Readiness: rabbitmq reports Degraded, not Unhealthy, when the broker is down
+curl -s localhost:8080/health/ready
+
+# The whole flow
+npx apus-ai providers
+```
+
+### Rotating the at-rest key
+
+```bash
+Encryption__Keys__2="$(openssl rand -base64 32)"
+Encryption__CurrentKeyVersion=2
+```
+
+New writes use version 2 immediately; `CredentialRotationWorker` re-seals existing rows
+in the background. Keep version 1 until nothing reports it:
+
+```sql
+SELECT encryption_key_version, count(*) FROM provider_credentials GROUP BY 1;
+```
+
+### Operational notes
+
+- **RabbitMQ is no longer required to start.** The publisher connects lazily and retries;
+  the readiness check reports `Degraded` so the pod stays in service. Accounting is
+  unaffected — the usage ledger is written to Postgres on the request path.
+- **Workers** run in-process on every replica and are safe to run concurrently (period
+  rollover uses `ON CONFLICT DO NOTHING`, threshold notifications are claimed with a
+  conditional bitmask update). Set `Workers__Enabled=false` to disable them on a replica.
+- **Abandoned reservations** from a pod killed mid-request are swept after
+  `Workers__ReservationStaleMinutes` (default 30, which must exceed the longest possible
+  request; the proxy client times out at 10 minutes).
