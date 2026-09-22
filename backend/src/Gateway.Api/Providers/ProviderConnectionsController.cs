@@ -48,6 +48,10 @@ public sealed record AddOrgApiKeyRequest(string Provider, string ApiKey);
 /// </summary>
 [ApiController]
 [Route("api/v1/provider-connections")]
+// The un-versioned path is the one registered as the OAuth redirect URI with
+// providers. Redirect URIs are matched exactly and are painful to change once an
+// application is approved, so it is a first-class route, not a courtesy alias.
+[Route("api/provider-connections")]
 [Route("api/v1/admin/provider-credentials")]
 [Authorize]
 public sealed class ProviderConnectionsController : ControllerBase
@@ -235,7 +239,7 @@ public sealed class ProviderConnectionsController : ControllerBase
     [HttpPost("{provider}/oauth/start")]
     [HttpGet("{provider}/oauth/start")]
     [RequirePermission(Permissions.ProviderConnect)]
-    public async Task<IActionResult> OAuthStart(string provider, CancellationToken ct)
+    public async Task<IActionResult> OAuthStart(string provider, [FromQuery] bool redirect, CancellationToken ct)
     {
         var descriptor = ProviderCatalog.Find(provider);
         if (descriptor is null || !descriptor.Supports(ConnectionType.OAuth))
@@ -259,7 +263,11 @@ public sealed class ProviderConnectionsController : ControllerBase
         Response.Cookies.Append(FlowCookie, flowNonce, new CookieOptions
         {
             HttpOnly = true,
-            Secure = true,
+            // Behind NGINX or the ingress, UseForwardedHeaders makes this true in
+            // production. Hard-coding it would break the flow on a plain-HTTP local
+            // instance, where the browser would refuse to store the cookie and every
+            // callback would come back flow_mismatch.
+            Secure = Request.IsHttps,
             SameSite = SameSiteMode.Lax,  // Lax so it survives the provider's top-level redirect back
             Path = "/",
             MaxAge = StateTtl,
@@ -268,11 +276,14 @@ public sealed class ProviderConnectionsController : ControllerBase
         await _audit.WriteAsync(AuditActions.OAuthStarted, AuditResources.ProviderConnection, null,
             detail: $"provider={descriptor.Id}", ct: ct);
 
-        return Ok(new
-        {
-            authorizeUrl = OAuthTokenClient.BuildAuthorizeUrl(opt, state, Pkce.Challenge(verifier)),
-            expiresInSeconds = (int)StateTtl.TotalSeconds,
-        });
+        var authorizeUrl = OAuthTokenClient.BuildAuthorizeUrl(opt, state, Pkce.Challenge(verifier));
+
+        // `?redirect=1` sends the browser straight on, so "Connect Anthropic" can be a
+        // plain link. The JSON form is for the dashboard, which wants to show an error
+        // in place rather than navigate away on a failure.
+        return redirect
+            ? Redirect(authorizeUrl)
+            : Ok(new { authorizeUrl, expiresInSeconds = (int)StateTtl.TotalSeconds });
     }
 
     /// <summary>
