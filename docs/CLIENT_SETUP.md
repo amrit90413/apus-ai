@@ -56,7 +56,9 @@ echo "$PASSWORD" | npx apus-ai setup --api https://ai.example.com \
 ## 3. Manual configuration
 
 Replace `https://ai.example.com` with your gateway URL and `apus_...` with a key
-minted at `POST /api/v1/me/keys` (or from the wizard). Use only model ids your
+from the **Your API keys** section of the `/usage` dashboard — which also prints a
+ready-to-paste Claude Code block filled in with your gateway URL and allocated
+models — or from the wizard, or `POST /api/v1/me/keys`. Use only model ids your
 admin allocated (`GET /api/v1/me/models` or `GET /v1/models`).
 
 ### Claude Code CLI
@@ -78,6 +80,21 @@ admin allocated (`GET /api/v1/me/models` or `GET /v1/models`).
   "hasCompletedOnboarding": true
 }
 ```
+
+> **If Claude Code shows a login screen, stop.** A prompt asking how you want to
+> log in — *Claude.ai Subscription* / *Anthropic Console* — means it is not reading
+> the settings above. Do not pick either option: both authenticate you straight to
+> Anthropic and bypass the gateway, so nothing is metered against your quota and
+> the usage lands on whatever account you signed in with. Quit, fix the config
+> (see below), and re-run `claude` — it should start with no login prompt at all.
+>
+> Usual causes, in order:
+> 1. `ANTHROPIC_API_KEY` is exported in your shell. It takes precedence over the
+>    settings file — `unset ANTHROPIC_API_KEY` (and remove it from `~/.zshrc`,
+>    `~/.bashrc`, or your dotfiles).
+> 2. You are already logged in from an earlier session — run `claude /logout`.
+> 3. The JSON was written to the wrong file. It must be `~/.claude/settings.json`,
+>    valid JSON, with the keys inside an `"env"` object.
 
 Omit the `*_OPUS_MODEL` / `*_HAIKU_MODEL` lines if those models are not
 allocated to you. `ANTHROPIC_AUTH_TOKEN` is sent as `Authorization: Bearer`;
@@ -142,7 +159,8 @@ hash; the gateway can show you only the first 12 characters (`apus_ab12cd3`)
 afterwards. A revoked key, or the key of a deactivated user, stops working
 within 30 seconds (per-pod lookup cache).
 
-Manage keys with a JWT:
+Keys are easiest to manage on the `/usage` dashboard (create, copy, revoke). The
+same operations over HTTP, with a JWT:
 
 ```bash
 curl -s -X POST https://ai.example.com/api/v1/me/keys \

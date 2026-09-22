@@ -1,6 +1,7 @@
 "use client";
 import { useCallback } from "react";
 import { adminApi, usePolling } from "@/lib/api";
+import KeysSection from "./keys-section";
 
 // Employee self-service: see your own usage + reset countdown.
 export default function UsagePage() {
@@ -43,6 +44,7 @@ export default function UsagePage() {
           );
         })}
       </div>
+      <KeysSection />
     </div>
   );
 }

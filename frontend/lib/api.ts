@@ -362,6 +362,19 @@ export interface PersonalKeyRow {
   revokedAt: string | null;
 }
 
+/** Returned once, at creation: `key` is never retrievable again. */
+export interface CreatedPersonalKey extends PersonalKeyRow {
+  key: string;
+}
+
+/** Self-service personal keys for the /v1 proxy. Minting requires a JWT session. */
+export const meApi = {
+  listKeys: () => get<{ keys: PersonalKeyRow[] }>("/v1/me/keys"),
+  createKey: (name: string) => post<CreatedPersonalKey>("/v1/me/keys", { name }),
+  revokeKey: (id: string) => del(`/v1/me/keys/${id}`),
+  models: () => get<{ models: string[] }>("/v1/me/models"),
+};
+
 export const adminApi = {
   // Super-admin: cross-tenant rollup (ClickHouse-backed).
   organizations: () => get<{ orgs: OrgRow[]; totals: { orgs: number; employees: number; tokensToday: number; costToday: number } }>("/v1/admin/organizations"),
