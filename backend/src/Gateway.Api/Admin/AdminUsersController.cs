@@ -105,7 +105,7 @@ public sealed class AdminUsersController : ControllerBase
         if (phoneError is not null)
             return BadRequest(new { error = new { code = "invalid_phone", message = phoneError } });
         // Admins log in through the WhatsApp OTP, so they cannot exist without a number.
-        if (req.Role >= Role.OrgAdmin && phone is null && _whatsapp.Enabled)
+        if (RoleTiers.IsOrgAdmin(req.Role) && phone is null && _whatsapp.Enabled)
             return BadRequest(new { error = new { code = "phone_required", message = "Admin accounts need a WhatsApp number for OTP login." } });
 
         var workspace = await _db.Workspaces.FirstOrDefaultAsync(w => w.Id == req.WorkspaceId, ct);

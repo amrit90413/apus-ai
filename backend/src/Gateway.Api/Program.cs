@@ -1,16 +1,24 @@
 using Gateway.Api;
 using Gateway.Api.Admin;
+using Gateway.Api.Allowances;
+using Gateway.Api.Billing;
 using Gateway.Api.Auth;
 using Gateway.Api.Gateway;
 using Gateway.Api.Messaging;
 using Gateway.Api.Persistence;
 using Gateway.Api.Providers;
+using Gateway.Api.Providers.Upstream;
 using Gateway.Api.Quota;
+using Gateway.Api.Usage;
+using Gateway.Api.Workers;
 using Gateway.Api.Security;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
+// ASP.NET's own RateLimiter type collides with the gateway's; the gateway one is meant here.
+using RateLimiter = Gateway.Api.Quota.RateLimiter;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using OpenTelemetry.Metrics;
@@ -39,7 +47,19 @@ builder.Services.AddSingleton<TokenService>();
 // ---- Secrets at rest + self-service registration ----
 builder.Services.AddSingleton(builder.Configuration.GetSection("Encryption").Get<EncryptionOptions>() ?? new EncryptionOptions());
 builder.Services.AddSingleton<ISecretProtector, SecretProtector>();
+// Versioned data keys so provider secrets can be re-sealed without downtime. Swap
+// ConfiguredDataKeyProvider for a KMS-backed one to move to envelope encryption.
+builder.Services.AddSingleton<IDataKeyProvider, ConfiguredDataKeyProvider>();
+builder.Services.AddSingleton<ICredentialEncryption, CredentialEncryption>();
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<IAuditWriter, AuditWriter>();
 builder.Services.AddSingleton(builder.Configuration.GetSection("Registration").Get<RegistrationOptions>() ?? new RegistrationOptions());
+
+// ---- Billing, platform policy and rollout flags ----
+builder.Services.AddSingleton(builder.Configuration.GetSection("Billing").Get<BillingOptions>() ?? new BillingOptions());
+builder.Services.AddSingleton(builder.Configuration.GetSection("Ai:Platform").Get<PlatformAiPolicyOptions>() ?? new PlatformAiPolicyOptions());
+builder.Services.AddSingleton(builder.Configuration.GetSection("Features").Get<FeatureFlagOptions>() ?? new FeatureFlagOptions());
+builder.Services.AddSingleton<IFeatureFlags, FeatureFlags>();
 
 // ---- WhatsApp OTP ----
 var waOpt = builder.Configuration.GetSection("WhatsApp").Get<WhatsAppOptions>() ?? new WhatsAppOptions();
@@ -60,6 +80,7 @@ builder.Services.AddDbContext<GatewayDbContext>(o =>
 var redis = await ConnectionMultiplexer.ConnectAsync(builder.Configuration.GetConnectionString("Redis")!);
 builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
 builder.Services.AddSingleton<QuotaEngine>();
+builder.Services.AddSingleton<RateLimiter>();
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IPolicyCache, PolicyCache>();
 builder.Services.AddScoped<IQuotaPolicyResolver, QuotaPolicyResolver>();
@@ -94,19 +115,51 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, ApiKeyAuthenticationHandler>(ApiKeys.Scheme, null);
 builder.Services.AddAuthorization(o =>
 {
+    // Kept for existing endpoints; new ones authorize on a permission instead.
     o.AddPolicy("OrgAdmin", p => p.RequireRole("OrgAdmin", "SuperAdmin"));
     o.AddPolicy("SuperAdmin", p => p.RequireRole("SuperAdmin"));
 });
+// `[RequirePermission(Permissions.X)]` policies, created on demand. Unknown
+// permissions produce no policy, so an endpoint typo fails closed.
+builder.Services.AddSingleton<IAuthorizationPolicyProvider, PermissionPolicyProvider>();
+builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
 // ---- Provider credentials: per-org API key or OAuth (with server-side refresh) ----
 var oauthOpt = builder.Configuration.GetSection("Anthropic:OAuth").Get<AnthropicOAuthOptions>() ?? new AnthropicOAuthOptions();
 builder.Services.AddSingleton(oauthOpt);
 builder.Services.AddHttpClient(OAuthTokenClient.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(20));
-builder.Services.AddHttpClient("provider-probe", c => c.Timeout = TimeSpan.FromSeconds(15));
+builder.Services.AddHttpClient(ProviderValidator.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(15));
+builder.Services.AddHttpClient(GoogleServiceAccountTokens.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(20));
 builder.Services.AddSingleton<OAuthTokenClient>();
-builder.Services.AddSingleton<IProviderCredentialService, ProviderCredentialService>();
+builder.Services.AddSingleton<ProviderOAuthRegistry>();
+builder.Services.AddSingleton<GoogleServiceAccountTokens>();
+builder.Services.AddSingleton<IProviderValidator, ProviderValidator>();
+builder.Services.AddSingleton<IProviderConnectionService, ProviderConnectionService>();
+
+// ---- Upstream adapters: one per provider wire protocol ----
+builder.Services.AddSingleton<GeminiTranslation>();
+builder.Services.AddSingleton<IUpstreamAdapter, AnthropicUpstreamAdapter>();
+builder.Services.AddSingleton<IUpstreamAdapter, OpenAiUpstreamAdapter>();
+builder.Services.AddSingleton<IUpstreamAdapter, GeminiUpstreamAdapter>();
+builder.Services.AddSingleton<IUpstreamAdapter, BedrockUpstreamAdapter>();
+builder.Services.AddSingleton<IUpstreamAdapter, VertexUpstreamAdapter>();
+builder.Services.AddSingleton<UpstreamRouter>();
+
+// ---- Money allowances, pricing, usage ledger and the one enforcement pipeline ----
+builder.Services.AddSingleton<IAllowanceService, AllowanceService>();
+builder.Services.AddSingleton<IPricingService, PricingService>();
+builder.Services.AddSingleton<IUsageLedger, UsageLedgerService>();
+builder.Services.AddSingleton<GatewayMetrics>();
+builder.Services.AddScoped<IGatewayPipeline, GatewayPipeline>();
 builder.Services.AddScoped<ITokenBalanceService, TokenBalanceService>();
 builder.Services.AddScoped<UsageGate>();
+
+// ---- Background workers (health, refresh, rollover, notifications, rotation) ----
+builder.Services.AddSingleton(builder.Configuration.GetSection("Workers").Get<WorkerOptions>() ?? new WorkerOptions());
+builder.Services.AddHostedService<ProviderHealthWorker>();
+builder.Services.AddHostedService<AllowancePeriodWorker>();
+builder.Services.AddHostedService<NotificationWorker>();
+builder.Services.AddHostedService<CredentialRotationWorker>();
 // Raw passthrough client for /v1/messages: long generations, no retry (a retried
 // POST could double-bill), errors are relayed to the caller as-is.
 builder.Services.AddHttpClient(MessagesProxyController.HttpClientName, c => c.Timeout = TimeSpan.FromMinutes(10));
@@ -131,7 +184,9 @@ builder.Services.AddControllers();
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(r => r.AddService("gateway-api"))
     .WithTracing(t => t.AddAspNetCoreInstrumentation().AddHttpClientInstrumentation().AddOtlpExporter())
-    .WithMetrics(m => m.AddAspNetCoreInstrumentation().AddRuntimeInstrumentation().AddPrometheusExporter());
+    .WithMetrics(m => m.AddAspNetCoreInstrumentation().AddRuntimeInstrumentation()
+        .AddMeter(GatewayMetrics.MeterName)
+        .AddPrometheusExporter());
 
 // ---- Health checks (liveness/readiness for K8s) ----
 builder.Services.AddHealthChecks()
@@ -143,12 +198,16 @@ var bootstrapOpt = builder.Configuration.GetSection("Bootstrap").Get<BootstrapOp
 
 var app = builder.Build();
 
-// Load quota Lua scripts once at startup.
-await app.Services.GetRequiredService<QuotaEngine>()
-    .LoadScriptsAsync(Path.Combine(AppContext.BaseDirectory, "Quota"));
+// Load quota + rate-limit Lua scripts once at startup.
+var scriptDir = Path.Combine(AppContext.BaseDirectory, "Quota");
+await app.Services.GetRequiredService<QuotaEngine>().LoadScriptsAsync(scriptDir);
+await app.Services.GetRequiredService<RateLimiter>().LoadScriptsAsync(scriptDir);
 
 await DatabaseBootstrapper.RunAsync(app.Services, bootstrapOpt,
     app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Bootstrap"));
+
+// Seed the price list so a fresh deployment can cost requests immediately.
+await PricingSeed.RunAsync(app.Services, app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Pricing"));
 
 if (!waOpt.Enabled)
     app.Logger.LogWarning(
@@ -165,10 +224,12 @@ if (builder.Configuration.GetValue("ForwardedHeaders:TrustAllProxies", true))
 }
 app.UseForwardedHeaders(fwd);
 
-if (oauthOpt.Enabled)
-    app.Logger.LogInformation("Provider OAuth login enabled (client {ClientId}).", oauthOpt.ClientId);
+var enabledOAuth = app.Services.GetRequiredService<ProviderOAuthRegistry>().EnabledProviders;
+if (enabledOAuth.Count > 0)
+    app.Logger.LogInformation("Provider OAuth login enabled for: {Providers}", string.Join(", ", enabledOAuth));
 
 app.UseSerilogRequestLogging();
+app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseAuthentication();
 // Must run AFTER authentication: it reads the validated principal to scope EF's tenant
 // filters. Placed before it, every request looked anonymous and the filters were off.

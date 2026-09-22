@@ -7,10 +7,12 @@ namespace Gateway.Api.Providers;
 /// <summary>
 /// OAuth 2.0 client settings for connecting a provider account by web login.
 /// Disabled until ClientId, AuthorizeUrl, TokenUrl and RedirectUri are all set. Only
-/// configure a client that Anthropic issued to your organization — reusing another
+/// configure a client the provider issued to your organization — reusing another
 /// application's client id violates the provider's terms and gets the account blocked.
+///
+/// One instance per provider; see ProviderOAuthRegistry.
 /// </summary>
-public sealed class AnthropicOAuthOptions
+public class ProviderOAuthOptions
 {
     public string? ClientId { get; set; }
     public string? ClientSecret { get; set; }          // omit for public (PKCE-only) clients
@@ -22,11 +24,32 @@ public sealed class AnthropicOAuthOptions
     /// <summary>Refresh the access token this many seconds before it expires.</summary>
     public int RefreshSkewSeconds { get; set; } = 120;
 
+    /// <summary>
+    /// RFC 7009 revocation endpoint. Optional: when set, disconnecting tells the
+    /// provider to invalidate the grant instead of only forgetting it locally.
+    /// </summary>
+    public string? RevokeUrl { get; set; }
+
+    /// <summary>
+    /// Relative dashboard path the admin lands on after the redirect flow completes.
+    /// Relative by design — an absolute value here would be an open redirect.
+    /// </summary>
+    public string CompletionPath { get; set; } = "/settings/ai-providers";
+
     public bool Enabled =>
         !string.IsNullOrWhiteSpace(ClientId) &&
         Uri.IsWellFormedUriString(AuthorizeUrl, UriKind.Absolute) &&
         Uri.IsWellFormedUriString(TokenUrl, UriKind.Absolute) &&
         Uri.IsWellFormedUriString(RedirectUri, UriKind.Absolute);
+}
+
+/// <summary>
+/// The legacy `Anthropic:OAuth` configuration section. Kept as its own type so
+/// existing deployments and DI registrations keep working; `Providers:OAuth:anthropic`
+/// is the general form and takes precedence when both are set.
+/// </summary>
+public sealed class AnthropicOAuthOptions : ProviderOAuthOptions
+{
 }
 
 public sealed record OAuthTokenSet(
@@ -48,7 +71,7 @@ public sealed class OAuthTokenClient
     public const string HttpClientName = "oauth-token";
 
     private readonly IHttpClientFactory _httpFactory;
-    private readonly AnthropicOAuthOptions _opt;
+    private readonly ProviderOAuthOptions _opt;
     private readonly ILogger<OAuthTokenClient> _log;
 
     public OAuthTokenClient(IHttpClientFactory httpFactory, AnthropicOAuthOptions opt, ILogger<OAuthTokenClient> log)
@@ -56,46 +79,78 @@ public sealed class OAuthTokenClient
         _httpFactory = httpFactory; _opt = opt; _log = log;
     }
 
-    public string BuildAuthorizeUrl(string state, string codeChallenge)
+    public string BuildAuthorizeUrl(string state, string codeChallenge) =>
+        BuildAuthorizeUrl(_opt, state, codeChallenge);
+
+    public Task<OAuthTokenSet> ExchangeCodeAsync(ProviderOAuthOptions opt, string code, string codeVerifier, CancellationToken ct) =>
+        PostAsync(opt, new Dictionary<string, string>
+        {
+            ["grant_type"] = "authorization_code",
+            ["code"] = code,
+            ["redirect_uri"] = opt.RedirectUri,
+            ["code_verifier"] = codeVerifier,
+        }, ct);
+
+    public Task<OAuthTokenSet> RefreshAsync(ProviderOAuthOptions opt, string refreshToken, CancellationToken ct) =>
+        PostAsync(opt, new Dictionary<string, string>
+        {
+            ["grant_type"] = "refresh_token",
+            ["refresh_token"] = refreshToken,
+        }, ct);
+
+    public static string BuildAuthorizeUrl(ProviderOAuthOptions opt, string state, string codeChallenge)
     {
         var query = new Dictionary<string, string?>
         {
             ["response_type"] = "code",
-            ["client_id"] = _opt.ClientId,
-            ["redirect_uri"] = _opt.RedirectUri,
-            ["scope"] = _opt.Scopes,
+            ["client_id"] = opt.ClientId,
+            ["redirect_uri"] = opt.RedirectUri,
+            ["scope"] = opt.Scopes,
             ["state"] = state,
             ["code_challenge"] = codeChallenge,
             ["code_challenge_method"] = "S256",
         };
         var qs = string.Join("&", query.Where(kv => !string.IsNullOrEmpty(kv.Value))
             .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value!)}"));
-        var sep = _opt.AuthorizeUrl.Contains('?') ? "&" : "?";
-        return $"{_opt.AuthorizeUrl}{sep}{qs}";
+        var sep = opt.AuthorizeUrl.Contains('?') ? "&" : "?";
+        return $"{opt.AuthorizeUrl}{sep}{qs}";
     }
 
     public Task<OAuthTokenSet> ExchangeCodeAsync(string code, string codeVerifier, CancellationToken ct) =>
-        PostAsync(new Dictionary<string, string>
-        {
-            ["grant_type"] = "authorization_code",
-            ["code"] = code,
-            ["redirect_uri"] = _opt.RedirectUri,
-            ["code_verifier"] = codeVerifier,
-        }, ct);
+        ExchangeCodeAsync(_opt, code, codeVerifier, ct);
 
     public Task<OAuthTokenSet> RefreshAsync(string refreshToken, CancellationToken ct) =>
-        PostAsync(new Dictionary<string, string>
-        {
-            ["grant_type"] = "refresh_token",
-            ["refresh_token"] = refreshToken,
-        }, ct);
+        RefreshAsync(_opt, refreshToken, ct);
 
-    private async Task<OAuthTokenSet> PostAsync(Dictionary<string, string> form, CancellationToken ct)
+    /// <summary>
+    /// RFC 7009 token revocation. Best effort by design: the spec says a server may
+    /// answer 200 for an already-invalid token, and a provider that is down must not
+    /// stop an admin from disconnecting locally.
+    /// </summary>
+    public async Task RevokeAsync(ProviderOAuthOptions opt, string token, CancellationToken ct)
     {
-        form["client_id"] = _opt.ClientId!;
-        if (!string.IsNullOrEmpty(_opt.ClientSecret)) form["client_secret"] = _opt.ClientSecret;
+        if (string.IsNullOrWhiteSpace(opt.RevokeUrl)) return;
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, _opt.TokenUrl)
+        var form = new Dictionary<string, string>
+        {
+            ["token"] = token,
+            ["client_id"] = opt.ClientId!,
+        };
+        if (!string.IsNullOrEmpty(opt.ClientSecret)) form["client_secret"] = opt.ClientSecret;
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, opt.RevokeUrl) { Content = new FormUrlEncodedContent(form) };
+        using var http = _httpFactory.CreateClient(HttpClientName);
+        using var resp = await http.SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode)
+            _log.LogWarning("Token revocation returned {Status}.", (int)resp.StatusCode);
+    }
+
+    private async Task<OAuthTokenSet> PostAsync(ProviderOAuthOptions opt, Dictionary<string, string> form, CancellationToken ct)
+    {
+        form["client_id"] = opt.ClientId!;
+        if (!string.IsNullOrEmpty(opt.ClientSecret)) form["client_secret"] = opt.ClientSecret;
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, opt.TokenUrl)
         {
             Content = new FormUrlEncodedContent(form)
         };

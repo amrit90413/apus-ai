@@ -1,12 +1,13 @@
 using System.Net;
 using System.Security.Claims;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Gateway.Api.Auth;
-using Gateway.Api.Messaging;
+using Gateway.Api.Billing;
+using Gateway.Api.Domain;
 using Gateway.Api.Providers;
+using Gateway.Api.Providers.Upstream;
 using Gateway.Api.Quota;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -15,11 +16,15 @@ using Microsoft.Extensions.Options;
 namespace Gateway.Api.Gateway;
 
 /// <summary>
-/// Anthropic-compatible surface for IDE clients (Claude Code, Cline, Roo, ...): the
-/// request body is forwarded to Anthropic byte-for-byte (after normalising the model
-/// id) and the response — SSE or JSON — is streamed back verbatim. Around that
-/// passthrough the gateway enforces the caller's allowed models, prepaid balance and
-/// rolling windows using the provider's own `usage` block, and records the call.
+/// The Anthropic-compatible surface IDE clients talk to (Claude Code, Cline, Roo, the
+/// APUS CLI).
+///
+/// Everything a request must satisfy — tenant, member status, model and provider
+/// policy, rate limits, concurrency, token windows, prepaid tokens, currency allowance
+/// — is decided by <see cref="IGatewayPipeline"/>, not here; this controller parses the
+/// request, hands it to the pipeline, relays bytes through the provider's adapter and
+/// settles. That is what keeps the /v1 surface and every other entry point enforcing
+/// the same rules.
 /// </summary>
 [ApiController]
 [Route("v1")]
@@ -29,22 +34,24 @@ public sealed partial class MessagesProxyController : ControllerBase
     public const string HttpClientName = "anthropic-proxy";
     private const long MaxBodyBytes = 32L * 1024 * 1024;
     private const int DefaultMaxTokens = 4096;
+    /// <summary>Rough bytes-per-token for the pre-flight estimate; reconciled against real usage.</summary>
+    private const int BytesPerToken = 4;
 
+    private readonly IGatewayPipeline _pipeline;
     private readonly IQuotaPolicyResolver _policies;
-    private readonly UsageGate _gate;
-    private readonly IProviderCredentialService _credentials;
+    private readonly IProviderConnectionService _connections;
+    private readonly UpstreamRouter _upstream;
     private readonly IHttpClientFactory _httpFactory;
     private readonly AnthropicOptions _opt;
-    private readonly IUsageEventPublisher _usage;
     private readonly ILogger<MessagesProxyController> _log;
 
     public MessagesProxyController(
-        IQuotaPolicyResolver policies, UsageGate gate, IProviderCredentialService credentials,
-        IHttpClientFactory httpFactory, IOptions<AnthropicOptions> opt, IUsageEventPublisher usage,
+        IGatewayPipeline pipeline, IQuotaPolicyResolver policies, IProviderConnectionService connections,
+        UpstreamRouter upstream, IHttpClientFactory httpFactory, IOptions<AnthropicOptions> opt,
         ILogger<MessagesProxyController> log)
     {
-        _policies = policies; _gate = gate; _credentials = credentials; _httpFactory = httpFactory;
-        _opt = opt.Value; _usage = usage; _log = log;
+        _pipeline = pipeline; _policies = policies; _connections = connections; _upstream = upstream;
+        _httpFactory = httpFactory; _opt = opt.Value; _log = log;
     }
 
     // ------------------------------------------------------------------ models
@@ -55,9 +62,24 @@ public sealed partial class MessagesProxyController : ControllerBase
     {
         var (principal, _) = Identity();
         var policy = await _policies.ResolveAsync(principal, ct);
+        var connected = await _connections.ConnectedProvidersAsync(policy.OrganizationId, ct);
+
+        // A model the tenant cannot reach is not "available", so the list is the
+        // intersection of what the member is allowed and what is actually connected.
         var data = policy.AllowedModels
-            .Select(id => new { id, type = "model", display_name = ModelCatalog.DisplayName(id), created_at = ModelCatalog.CreatedAt(id) })
+            .Select(id => new
+            {
+                id,
+                type = "model",
+                display_name = ModelCatalog.DisplayName(id),
+                created_at = ModelCatalog.CreatedAt(id),
+                providers = ProviderCatalog.ProvidersForModel(id)
+                    .Where(p => policy.AllowsProvider(p) && connected.Contains(p, StringComparer.OrdinalIgnoreCase))
+                    .ToList(),
+            })
+            .Where(m => m.providers.Count > 0)
             .ToList();
+
         return Ok(new { data, has_more = false, first_id = data.FirstOrDefault()?.id, last_id = data.LastOrDefault()?.id });
     }
 
@@ -70,24 +92,71 @@ public sealed partial class MessagesProxyController : ControllerBase
         var (principal, _) = Identity();
         var parsed = await ReadBodyAsync(ct);
         if (parsed is null) return;
-        var (body, model, _, _) = parsed.Value;
+        var (raw, body, model, _, _) = parsed.Value;
 
         var policy = await _policies.ResolveAsync(principal, ct);
-        if (!policy.AllowedModels.Contains(model, StringComparer.OrdinalIgnoreCase))
+        if (!policy.AllowsModel(model))
         {
-            await WriteError(403, "permission_error", $"Model '{model}' is not enabled for your account.");
+            await WriteError(GatewayErrorCodes.ModelNotAllowed, $"Model '{model}' is not enabled for your account.");
             return;
         }
 
-        var auth = await ResolveAuthAsync(policy.OrganizationId);
-        if (auth is null) return;
+        var connection = await ResolveForCountAsync(policy, model, ct);
+        if (connection is null)
+        {
+            await WriteError(GatewayErrorCodes.ProviderNotConnected,
+                "No AI provider is connected for your organization. Ask your admin to connect one.");
+            return;
+        }
 
-        using var req = BuildUpstream("v1/messages/count_tokens", body, auth);
+        // Anthropic exposes a real counter; for the others the gateway returns its own
+        // estimate rather than pretending an API exists. Either way this is free and
+        // charges nothing.
+        if (connection.Provider != ProviderCatalog.Anthropic)
+        {
+            Response.StatusCode = 200;
+            Response.ContentType = "application/json";
+            await Response.WriteAsync(JsonSerializer.Serialize(new
+            {
+                input_tokens = Math.Max(1, raw.Length / BytesPerToken),
+                estimated = true,
+            }), ct);
+            return;
+        }
+
+        using var req = new HttpRequestMessage(HttpMethod.Post,
+            $"{ProviderEndpoints.RuntimeBase(connection)}/v1/messages/count_tokens")
+        {
+            Content = new ByteArrayContent(raw),
+        };
+        req.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        ProviderConnectionService.ApplyAuth(req, ProviderEndpoints.SchemeFor(connection), connection.Secret);
+        req.Headers.Add("anthropic-version", Request.Headers["anthropic-version"].FirstOrDefault() ?? _opt.Version);
+
         using var http = _httpFactory.CreateClient(HttpClientName);
         using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
-        if (await HandleUpstreamAuthFailure(resp, policy.OrganizationId)) return;
 
-        await CopyResponseAsync(resp, ct);
+        if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            await _connections.ReportFailureAsync(connection.ConnectionId, (int)resp.StatusCode, "provider rejected the credential", ct);
+            await WriteError(GatewayErrorCodes.InvalidProviderCredential,
+                "The AI provider rejected your organization's credential. Ask your admin to reconnect it.");
+            return;
+        }
+
+        Response.StatusCode = (int)resp.StatusCode;
+        Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+        await Response.Body.WriteAsync(await resp.Content.ReadAsByteArrayAsync(ct), ct);
+    }
+
+    private async Task<ResolvedConnection?> ResolveForCountAsync(EffectivePolicy policy, string model, CancellationToken ct)
+    {
+        foreach (var candidate in ProviderCatalog.ProvidersForModel(model).Where(policy.AllowsProvider))
+        {
+            var connection = await _connections.ResolveAsync(policy.OrganizationId, candidate, ct);
+            if (connection is not null && ConnectionStatuses.CanServe(connection.Status)) return connection;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- messages
@@ -101,102 +170,150 @@ public sealed partial class MessagesProxyController : ControllerBase
 
         var parsed = await ReadBodyAsync(ct);
         if (parsed is null) return;
-        var (body, model, maxTokens, streaming) = parsed.Value;
+        var (raw, body, model, maxTokens, streaming) = parsed.Value;
 
-        var policy = await _policies.ResolveAsync(principal, ct);
+        var request = new GatewayRequest(
+            principal, sessionId, model,
+            EstimatedInputTokens: raw.Length / BytesPerToken,
+            MaxOutputTokens: maxTokens,
+            CorrelationId: correlationId,
+            ClientIp: HttpContext.Connection.RemoteIpAddress?.ToString(),
+            Streaming: streaming);
 
-        // Same heuristic as the CLI endpoint: ~4 bytes per token, reconciled afterwards.
-        long estimate = (body.Length / 4) + maxTokens;
-
-        var gate = await _gate.ReserveAsync(policy, principal, model, estimate, correlationId, ct);
-        EmitQuotaHeaders(gate);
-        if (!gate.Allowed)
+        GatewayAdmission admission;
+        try
         {
-            var (status, type) = gate.Code switch
-            {
-                "model_not_allowed" => (403, "permission_error"),
-                "balance_exhausted" => (402, "permission_error"), // not retryable: needs an admin top-up
-                _ => (429, "rate_limit_error"),
-            };
-            await WriteError(status, type, gate.Message!, gate.RetryAfterSeconds);
+            admission = await _pipeline.AdmitAsync(request, ct);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            await WriteError(GatewayErrorCodes.UserAiAccessDisabled, "Your account is not a member of this workspace.");
             return;
         }
 
-        var started = DateTimeOffset.UtcNow;
-        var usage = new UsageAccumulator();
-        var succeeded = false;
+        if (!admission.Allowed)
+        {
+            EmitPolicyHeaders(admission);
+            await WriteError(admission.ErrorCode!, admission.Message!, admission.RetryAfterSeconds);
+            return;
+        }
+
+        EmitPolicyHeaders(admission);
+
+        var tokens = BilledTokens.None;
+        var status = UsageStatus.Failed;
+        int? httpStatus = null;
+        string? failureCategory = null;
 
         try
         {
-            var auth = await ResolveAuthAsync(policy.OrganizationId);
-            if (auth is null) return; // 503 already written
-
-            using var req = BuildUpstream("v1/messages", body, auth);
-            using var http = _httpFactory.CreateClient(HttpClientName);
-            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-
-            if (await HandleUpstreamAuthFailure(resp, policy.OrganizationId)) return;
-
-            if (!resp.IsSuccessStatusCode)
+            var attempt = admission;
+            while (true)
             {
-                // Anthropic's own error body (invalid_request_error, overloaded_error, ...)
-                // goes back unchanged so the client can act on it.
-                await CopyResponseAsync(resp, ct);
-                return;
-            }
+                var result = await CallProviderAsync(attempt, body, raw, streaming, ct);
+                tokens = result.Tokens;
+                httpStatus = result.HttpStatus;
+                failureCategory = result.FailureCategory;
 
-            if (streaming && IsEventStream(resp))
-                await StreamThroughAsync(resp, usage, ct);
-            else
-                await RelayJsonAsync(resp, usage, ct);
-            succeeded = true;
+                // Fail over only while nothing has reached the client: once bytes are on
+                // the wire, retrying elsewhere would duplicate the answer.
+                if (result.ShouldFailover && !Response.HasStarted)
+                {
+                    var next = await _pipeline.FallbackAsync(attempt, ct);
+                    if (next is not null) { attempt = next; continue; }
+                }
+
+                status = result.Status;
+                admission = attempt;
+                break;
+            }
         }
         catch (OperationCanceledException)
         {
-            // Client went away mid-stream; whatever usage we saw is charged below.
+            // Client went away mid-stream; whatever usage was seen is still charged.
+            status = UsageStatus.Cancelled;
+            failureCategory = "client_disconnected";
+        }
+        catch (GoogleCredentialException ex)
+        {
+            status = UsageStatus.Failed;
+            failureCategory = "credential_invalid";
+            await _connections.ReportFailureAsync(admission.Connection!.ConnectionId, 401, ex.Message, CancellationToken.None);
+            if (!Response.HasStarted)
+                await WriteError(GatewayErrorCodes.InvalidProviderCredential,
+                    "The AI provider rejected your organization's credential. Ask your admin to reconnect it.");
         }
         catch (HttpRequestException ex)
         {
+            status = UsageStatus.Failed;
+            failureCategory = "upstream_unreachable";
             _log.LogError(ex, "Upstream request failed (corr {Corr})", correlationId);
             if (!Response.HasStarted)
-                await WriteError(502, "api_error", "Upstream AI provider is unreachable.");
+                await WriteError(GatewayErrorCodes.ProviderUnavailable, "Upstream AI provider is unreachable.");
         }
         finally
         {
-            // Settle the reservation whatever happened. A failed call before any usage
-            // arrived refunds the estimate; a partial stream charges what was produced.
-            var real = usage.Total;
-            var balanceAfter = await _gate.ReconcileAsync(policy, principal, gate, model, estimate, real, correlationId);
+            // Settle whatever happened: a failed call before any usage arrived refunds
+            // the reservation, a partial stream charges what was produced.
+            var settlement = await _pipeline.SettleAsync(admission, request,
+                new GatewayOutcome(tokens, status, httpStatus, failureCategory));
 
-            if (real > 0 || succeeded)
-            {
-                try
-                {
-                    await _usage.PublishAsync(new UsageEvent(
-                        EventId: Guid.NewGuid(),
-                        OrganizationId: policy.OrganizationId,
-                        WorkspaceId: principal.WorkspaceId,
-                        UserId: principal.UserId,
-                        SessionId: sessionId,
-                        Provider: "anthropic",
-                        Model: model,
-                        InputTokens: usage.InputTotal,
-                        OutputTokens: usage.Output,
-                        LatencyMs: (int)(DateTimeOffset.UtcNow - started).TotalMilliseconds,
-                        EstimatedCostUsd: CostTable.Estimate(model, new TokenUsage(usage.InputTotal, usage.Output)),
-                        OccurredAt: started,
-                        CorrelationId: correlationId,
-                        ClientIp: HttpContext.Connection.RemoteIpAddress?.ToString()), CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogError(ex, "Usage event publish failed (corr {Corr})", correlationId);
-                }
-            }
-
-            _log.LogInformation("proxy user={User} model={Model} in={In} out={Out} balance={Balance} corr={Corr}",
-                principal.UserId, model, usage.InputTotal, usage.Output, balanceAfter, correlationId);
+            _log.LogInformation(
+                "gateway user={User} provider={Provider} model={Model} in={In} out={Out} cost={Cost} status={Status} corr={Corr}",
+                principal.UserId, admission.Provider, admission.Model, tokens.Input + tokens.CachedInput,
+                tokens.Output, settlement.CustomerCost, status, correlationId);
         }
+    }
+
+    private sealed record ProviderCallResult(
+        BilledTokens Tokens, UsageStatus Status, int? HttpStatus, string? FailureCategory, bool ShouldFailover);
+
+    /// <summary>Sends one attempt at one provider and relays whatever comes back.</summary>
+    private async Task<ProviderCallResult> CallProviderAsync(
+        GatewayAdmission admission, JsonObject body, byte[] raw, bool streaming, CancellationToken ct)
+    {
+        var connection = admission.Connection!;
+        var adapter = _upstream.For(admission.Provider);
+
+        var call = new UpstreamCall(
+            connection, admission.Model, body, raw, streaming,
+            Request.Headers["anthropic-version"].FirstOrDefault(),
+            Request.Headers["anthropic-beta"].Where(b => !string.IsNullOrWhiteSpace(b)).Select(b => b!).ToList());
+
+        using var req = await adapter.BuildAsync(call, ct);
+        using var http = _httpFactory.CreateClient(HttpClientName);
+        using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+
+        if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            // The tenant's stored credential is bad — never the caller's personal key.
+            await _connections.ReportFailureAsync(connection.ConnectionId, (int)resp.StatusCode,
+                "provider rejected the credential", CancellationToken.None);
+            _connections.Invalidate(admission.Policy.OrganizationId, admission.Provider);
+            _log.LogError("{Provider} rejected the credential for org {Org} ({Status})",
+                admission.Provider, admission.Policy.OrganizationId, (int)resp.StatusCode);
+
+            if (!Response.HasStarted && admission.FallbackProviders.Count == 0)
+                await WriteError(GatewayErrorCodes.InvalidProviderCredential,
+                    "The AI provider rejected your organization's credential. Ask your admin to reconnect it.");
+
+            return new ProviderCallResult(BilledTokens.None, UsageStatus.Failed, (int)resp.StatusCode,
+                "credential_rejected", ShouldFailover: true);
+        }
+
+        // 5xx and 429 are worth another provider; a 4xx is the client's own request and
+        // would fail identically everywhere.
+        var transient = (int)resp.StatusCode >= 500 || resp.StatusCode == HttpStatusCode.TooManyRequests;
+        if (transient && admission.FallbackProviders.Count > 0 && !Response.HasStarted)
+            return new ProviderCallResult(BilledTokens.None, UsageStatus.Failed, (int)resp.StatusCode,
+                "upstream_" + (int)resp.StatusCode, ShouldFailover: true);
+
+        var sink = new HttpResponseSink(Response);
+        var tokens = await adapter.RelayAsync(call, resp, sink, ct);
+
+        var status = resp.IsSuccessStatusCode ? UsageStatus.Succeeded : UsageStatus.Failed;
+        return new ProviderCallResult(tokens, status, (int)resp.StatusCode,
+            resp.IsSuccessStatusCode ? null : "upstream_" + (int)resp.StatusCode, ShouldFailover: false);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -208,7 +325,7 @@ public sealed partial class MessagesProxyController : ControllerBase
         Guid.Parse(User.FindFirstValue("session_id")!));
 
     /// <summary>Reads and validates the JSON body; normalises the model id (strips Claude Code's "[1m]" hint).</summary>
-    private async Task<(byte[] body, string model, int maxTokens, bool stream)?> ReadBodyAsync(CancellationToken ct)
+    private async Task<(byte[] raw, JsonObject body, string model, int maxTokens, bool stream)?> ReadBodyAsync(CancellationToken ct)
     {
         using var ms = new MemoryStream();
         await Request.Body.CopyToAsync(ms, ct);
@@ -219,14 +336,14 @@ public sealed partial class MessagesProxyController : ControllerBase
         catch (JsonException) { node = null; }
         if (node is not JsonObject obj)
         {
-            await WriteError(400, "invalid_request_error", "Request body must be a JSON object.");
+            await WriteError(GatewayErrorCodes.InvalidRequest, "Request body must be a JSON object.");
             return null;
         }
 
         var rawModel = obj["model"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(rawModel) || rawModel.Length > 96)
         {
-            await WriteError(400, "invalid_request_error", "model is required.");
+            await WriteError(GatewayErrorCodes.InvalidRequest, "model is required.");
             return null;
         }
 
@@ -239,179 +356,60 @@ public sealed partial class MessagesProxyController : ControllerBase
 
         var maxTokens = obj["max_tokens"] is JsonValue mt && mt.TryGetValue<int>(out var m) && m > 0 ? m : DefaultMaxTokens;
         var stream = obj["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var s) && s;
-        return (raw, model, maxTokens, stream);
-    }
-
-    private async Task<ProviderAuth?> ResolveAuthAsync(Guid organizationId)
-    {
-        var auth = await _credentials.ResolveAsync(organizationId, "anthropic", HttpContext.RequestAborted)
-            ?? (string.IsNullOrWhiteSpace(_opt.ApiKey) ? null : new ProviderAuth(AuthScheme.ApiKey, _opt.ApiKey, Guid.Empty));
-        if (auth is null)
-            await WriteError(503, "api_error", "No AI provider is connected for your organization. Ask your admin to connect one.");
-        return auth;
-    }
-
-    private HttpRequestMessage BuildUpstream(string path, byte[] body, ProviderAuth auth)
-    {
-        var req = new HttpRequestMessage(HttpMethod.Post, $"{_opt.BaseUrl.TrimEnd('/')}/{path}")
-        {
-            Content = new ByteArrayContent(body)
-        };
-        req.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-        ProviderCredentialService.ApplyAuth(req, auth.Scheme, auth.Secret);
-
-        req.Headers.Add("anthropic-version", Request.Headers["anthropic-version"].FirstOrDefault() ?? _opt.Version);
-        // Client-requested betas ride along; ApplyAuth may already have added oauth-2025-04-20.
-        foreach (var beta in Request.Headers["anthropic-beta"].Where(b => !string.IsNullOrWhiteSpace(b)))
-            req.Headers.Add("anthropic-beta", beta!);
-        return req;
-    }
-
-    /// <summary>Upstream 401/403 means the org credential is bad — never the user's key.</summary>
-    private async Task<bool> HandleUpstreamAuthFailure(HttpResponseMessage resp, Guid organizationId)
-    {
-        if (resp.StatusCode is not (HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)) return false;
-        _credentials.Invalidate(organizationId, "anthropic");
-        _log.LogError("Anthropic rejected the credential for org {Org} ({Status})", organizationId, (int)resp.StatusCode);
-        await WriteError(503, "api_error", "The AI provider rejected your organization's credential. Ask your admin to reconnect it.");
-        return true;
-    }
-
-    private static bool IsEventStream(HttpResponseMessage resp) =>
-        resp.Content.Headers.ContentType?.MediaType?.Equals("text/event-stream", StringComparison.OrdinalIgnoreCase) == true;
-
-    private void CopyUpstreamHeaders(HttpResponseMessage resp)
-    {
-        Response.StatusCode = (int)resp.StatusCode;
-        Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
-        if (resp.Headers.TryGetValues("request-id", out var rid)) Response.Headers["request-id"] = rid.First();
-        if (resp.Headers.TryGetValues("anthropic-ratelimit-requests-remaining", out var rr)) Response.Headers["anthropic-ratelimit-requests-remaining"] = rr.First();
-    }
-
-    private async Task CopyResponseAsync(HttpResponseMessage resp, CancellationToken ct)
-    {
-        CopyUpstreamHeaders(resp);
-        var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
-        await Response.Body.WriteAsync(bytes, ct);
-    }
-
-    private async Task RelayJsonAsync(HttpResponseMessage resp, UsageAccumulator usage, CancellationToken ct)
-    {
-        var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
-        try
-        {
-            using var doc = JsonDocument.Parse(bytes);
-            if (doc.RootElement.TryGetProperty("usage", out var u)) usage.Apply(u);
-        }
-        catch (JsonException) { /* relay anyway; usage stays 0 and the estimate is refunded */ }
-
-        CopyUpstreamHeaders(resp);
-        await Response.Body.WriteAsync(bytes, ct);
+        return (raw, obj, model, maxTokens, stream);
     }
 
     /// <summary>
-    /// Pipe SSE bytes straight through while tee-parsing `data:` lines for the
-    /// message_start / message_delta usage blocks. Nothing is buffered beyond one
-    /// partial line, so time-to-first-token is unaffected.
+    /// Tells the client where it stands without a second round trip: remaining
+    /// allowance, remaining prepaid tokens and the tightest rolling window.
     /// </summary>
-    private async Task StreamThroughAsync(HttpResponseMessage resp, UsageAccumulator usage, CancellationToken ct)
-    {
-        CopyUpstreamHeaders(resp);
-        Response.Headers.CacheControl = "no-cache";
-        Response.Headers["X-Accel-Buffering"] = "no";
-
-        await using var upstream = await resp.Content.ReadAsStreamAsync(ct);
-        var buffer = new byte[16 * 1024];
-        var line = new StringBuilder();
-
-        int read;
-        while ((read = await upstream.ReadAsync(buffer, ct)) > 0)
-        {
-            await Response.Body.WriteAsync(buffer.AsMemory(0, read), ct);
-            await Response.Body.FlushAsync(ct);
-
-            var text = Encoding.UTF8.GetString(buffer, 0, read);
-            foreach (var ch in text)
-            {
-                if (ch != '\n') { line.Append(ch); continue; }
-                usage.ApplySseLine(line.ToString());
-                line.Clear();
-            }
-        }
-        if (line.Length > 0) usage.ApplySseLine(line.ToString());
-    }
-
-    private void EmitQuotaHeaders(GateResult gate)
-    {
-        if (gate.Balance.Enforced) Response.Headers["X-Balance-Remaining"] = (gate.Balance.Remaining ?? 0).ToString();
-        var tightest = gate.Windows?.Windows.OrderBy(w => w.Remaining).FirstOrDefault();
-        if (tightest is null) return;
-        Response.Headers["X-Quota-Window"] = tightest.Name;
-        Response.Headers["X-Quota-Remaining"] = tightest.Remaining.ToString();
-        Response.Headers["X-Quota-Limit"] = tightest.Limit.ToString();
-        Response.Headers["X-Quota-Reset-Seconds"] = tightest.ResetInSeconds.ToString();
-    }
-
-    private async Task WriteError(int status, string type, string message, int? retryAfter = null)
+    private void EmitPolicyHeaders(GatewayAdmission admission)
     {
         if (Response.HasStarted) return;
+
+        if (admission.UserAllowanceEnforced)
+        {
+            Response.Headers["X-Allowance-Remaining"] = admission.UserRemaining.Minor.ToString();
+            Response.Headers["X-Allowance-Currency"] = admission.UserRemaining.Currency;
+        }
+        if (admission.OrganizationAllowanceEnforced)
+            Response.Headers["X-Org-Allowance-Remaining"] = admission.OrganizationRemaining.Minor.ToString();
+
+        if (admission.TokenGate?.Balance.Enforced == true)
+            Response.Headers["X-Balance-Remaining"] = (admission.TokenGate.Balance.Remaining ?? 0).ToString();
+
+        var tightest = admission.TokenGate?.Windows?.Windows.OrderBy(w => w.Remaining).FirstOrDefault();
+        if (tightest is not null)
+        {
+            Response.Headers["X-Quota-Window"] = tightest.Name;
+            Response.Headers["X-Quota-Remaining"] = tightest.Remaining.ToString();
+            Response.Headers["X-Quota-Limit"] = tightest.Limit.ToString();
+            Response.Headers["X-Quota-Reset-Seconds"] = tightest.ResetInSeconds.ToString();
+        }
+
+        if (!string.IsNullOrEmpty(admission.Provider)) Response.Headers["X-Apus-Provider"] = admission.Provider;
+    }
+
+    /// <summary>
+    /// Anthropic-shaped error carrying the stable APUS code, so an IDE renders the
+    /// message and a script can branch on `error.code`.
+    /// </summary>
+    private async Task WriteError(string code, string message, int? retryAfter = null)
+    {
+        if (Response.HasStarted) return;
+        var (status, type) = GatewayErrorCodes.Http(code);
         Response.StatusCode = status;
         Response.ContentType = "application/json";
-        if (retryAfter is not null) Response.Headers.RetryAfter = retryAfter.ToString();
-        await Response.WriteAsync(JsonSerializer.Serialize(new { type = "error", error = new { type, message } }));
+        if (retryAfter is not null) Response.Headers.RetryAfter = retryAfter.Value.ToString();
+        await Response.WriteAsync(JsonSerializer.Serialize(new
+        {
+            type = "error",
+            error = new { type, code, message },
+        }));
     }
 
     [GeneratedRegex(@"\[\d+[kKmM]?\]$")]
     private static partial Regex ContextHint();
-}
-
-/// <summary>
-/// Collects the authoritative token counts from Anthropic's `usage` objects. For a
-/// stream, message_start carries the input side and message_delta the output side
-/// (newer API versions repeat the input fields there too — later values win).
-/// Cache reads/writes are billed tokens, so they count toward the balance.
-/// </summary>
-public sealed class UsageAccumulator
-{
-    public int Input { get; private set; }
-    public int CacheCreation { get; private set; }
-    public int CacheRead { get; private set; }
-    public int Output { get; private set; }
-
-    public int InputTotal => Input + CacheCreation + CacheRead;
-    public long Total => (long)InputTotal + Output;
-
-    public void Apply(JsonElement usage)
-    {
-        if (usage.ValueKind != JsonValueKind.Object) return;
-        if (usage.TryGetProperty("input_tokens", out var i) && i.TryGetInt32(out var iv)) Input = iv;
-        if (usage.TryGetProperty("cache_creation_input_tokens", out var c) && c.TryGetInt32(out var cv)) CacheCreation = cv;
-        if (usage.TryGetProperty("cache_read_input_tokens", out var r) && r.TryGetInt32(out var rv)) CacheRead = rv;
-        if (usage.TryGetProperty("output_tokens", out var o) && o.TryGetInt32(out var ov)) Output = ov;
-    }
-
-    public void ApplySseLine(string line)
-    {
-        if (!line.StartsWith("data:", StringComparison.Ordinal) || !line.Contains("\"usage\"", StringComparison.Ordinal)) return;
-        var json = line["data:".Length..].Trim();
-        if (json.Length == 0 || json[0] != '{') return;
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
-            switch (type)
-            {
-                case "message_start":
-                    if (root.TryGetProperty("message", out var msg) && msg.TryGetProperty("usage", out var mu)) Apply(mu);
-                    break;
-                case "message_delta":
-                    if (root.TryGetProperty("usage", out var du)) Apply(du);
-                    break;
-            }
-        }
-        catch (JsonException) { /* partial or non-JSON data line; ignore */ }
-    }
 }
 
 /// <summary>Display metadata for GET /v1/models. Unknown ids fall back to a generated name.</summary>
@@ -429,6 +427,12 @@ public static class ModelCatalog
         ["claude-sonnet-4-6"] = ("Claude Sonnet 4.6", "2026-01-01T00:00:00Z"),
         ["claude-haiku-4-5"] = ("Claude Haiku 4.5", "2025-10-15T00:00:00Z"),
         ["claude-haiku-4-5-20251001"] = ("Claude Haiku 4.5", "2025-10-15T00:00:00Z"),
+        ["gpt-4o"] = ("GPT-4o", "2024-05-13T00:00:00Z"),
+        ["gpt-4o-mini"] = ("GPT-4o mini", "2024-07-18T00:00:00Z"),
+        ["gpt-4.1"] = ("GPT-4.1", "2025-04-14T00:00:00Z"),
+        ["gpt-4.1-mini"] = ("GPT-4.1 mini", "2025-04-14T00:00:00Z"),
+        ["gemini-2.5-pro"] = ("Gemini 2.5 Pro", "2025-03-25T00:00:00Z"),
+        ["gemini-2.5-flash"] = ("Gemini 2.5 Flash", "2025-04-17T00:00:00Z"),
     };
 
     public static string DisplayName(string id) =>

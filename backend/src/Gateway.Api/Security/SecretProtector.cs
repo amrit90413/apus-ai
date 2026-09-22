@@ -10,8 +10,21 @@ public sealed class EncryptionOptions
     /// `openssl rand -base64 32`. When unset the key is derived from Jwt:SigningKey
     /// (legacy behaviour) so rows encrypted by earlier versions still decrypt — set a
     /// dedicated key in production so a JWT-key rotation cannot brick stored secrets.
+    ///
+    /// This is key version 1. Later versions are supplied through <see cref="Keys"/>.
     /// </summary>
     public string? DataKey { get; set; }
+
+    /// <summary>
+    /// Additional data keys by version, e.g. Encryption:Keys:2 = "&lt;base64&gt;". Rotation is
+    /// non-breaking: add the new key, point CurrentKeyVersion at it, and rows re-seal
+    /// themselves as the rotation worker walks them. Keep the old key until every row
+    /// reports the new version.
+    /// </summary>
+    public Dictionary<string, string> Keys { get; set; } = new();
+
+    /// <summary>Version new secrets are written under. 0 = the highest version supplied.</summary>
+    public int CurrentKeyVersion { get; set; }
 }
 
 public interface ISecretProtector

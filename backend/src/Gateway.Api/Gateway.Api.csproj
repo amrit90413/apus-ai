@@ -29,6 +29,7 @@
     <!-- Ship the Lua scripts next to the binary so QuotaEngine can load them. -->
     <None Update="Quota\quota_check.lua" CopyToOutputDirectory="PreserveNewest" />
     <None Update="Quota\quota_reconcile.lua" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Quota\rate_limit.lua" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
