@@ -52,7 +52,7 @@ public sealed class AuthController : ControllerBase
 
         // Admin and SuperAdmin must verify via WhatsApp OTP before receiving a JWT,
         // unless no OTP gateway is configured for this deployment.
-        if (membership.Role >= Role.OrgAdmin && _whatsapp.Enabled)
+        if (RoleTiers.IsOrgAdmin(membership.Role) && _whatsapp.Enabled)
         {
             if (string.IsNullOrWhiteSpace(user.PhoneNumber))
                 return UnprocessableEntity(new { error = new { code = "no_phone", message = "Admin account has no phone number. Contact your super admin." } });
@@ -73,7 +73,7 @@ public sealed class AuthController : ControllerBase
                 Message: $"OTP sent to WhatsApp number ending in {user.PhoneNumber[^4..]}"));
         }
 
-        if (membership.Role >= Role.OrgAdmin)
+        if (RoleTiers.IsOrgAdmin(membership.Role))
             await Audit(user.OrganizationId, user.Id, "admin_login_without_otp",
                 $"device={req.DeviceName} reason=whatsapp_disabled");
 

@@ -26,9 +26,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Protocol translation and signing are internal by design; the tests that pin
+         their behaviour need to see them without making them part of the API. -->
+    <InternalsVisibleTo Include="Gateway.Api.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Ship the Lua scripts next to the binary so QuotaEngine can load them. -->
     <None Update="Quota\quota_check.lua" CopyToOutputDirectory="PreserveNewest" />
     <None Update="Quota\quota_reconcile.lua" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Quota\rate_limit.lua" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

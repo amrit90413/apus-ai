@@ -6,6 +6,30 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # The allowance engine and the rate limiter are only meaningful under real
+    # concurrency, so their tests run against real Postgres and Redis. Without these
+    # services the suite still passes — those tests skip — which would quietly stop
+    # covering the exact races they exist for.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APUS_TEST_POSTGRES: "Host=127.0.0.1;Port=5432;Database=postgres;Username=gateway;Password=gateway"
+      APUS_TEST_REDIS: "127.0.0.1:6379"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -13,6 +37,43 @@ jobs:
       - run: dotnet restore backend/src/Gateway.Api/Gateway.Api.csproj
       - run: dotnet build backend/src/Gateway.Api/Gateway.Api.csproj -c Release --no-restore
       - run: dotnet test backend/tests/Gateway.Api.Tests/Gateway.Api.Tests.csproj -c Release
+
+  migrations:
+    # Proves the fresh-install schema and the upgrade path produce the same database,
+    # and that re-running a migration is safe.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGPASSWORD: gateway
+      PSQL: "psql -h 127.0.0.1 -U gateway -v ON_ERROR_STOP=1 -q"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fresh install
+        run: |
+          $PSQL -d postgres -c 'CREATE DATABASE fresh'
+          $PSQL -d fresh -f infra/db/postgres-init.sql
+      - name: Upgrade from the previous schema
+        run: |
+          $PSQL -d postgres -c 'CREATE DATABASE upgraded'
+          git show HEAD~1:infra/db/postgres-init.sql > /tmp/previous.sql 2>/dev/null \
+            || cp infra/db/postgres-init.sql /tmp/previous.sql
+          $PSQL -d upgraded -f /tmp/previous.sql
+          $PSQL -d upgraded -f infra/db/migrations/003_token_allowance.sql
+          $PSQL -d upgraded -f infra/db/migrations/004_provider_connections_and_allowances.sql
+      - name: Migrations are idempotent
+        run: |
+          $PSQL -d upgraded -f infra/db/migrations/003_token_allowance.sql
+          $PSQL -d upgraded -f infra/db/migrations/004_provider_connections_and_allowances.sql
 
   cli:
     runs-on: ubuntu-latest

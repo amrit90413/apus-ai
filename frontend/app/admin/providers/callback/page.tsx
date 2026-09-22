@@ -2,20 +2,27 @@
 import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { adminApi, errorMessage } from "@/lib/api";
+import { providerApi, errorMessage } from "@/lib/api";
 
 type State =
   | { status: "working" }
   | { status: "ok"; expiresAt: string | null }
   | { status: "error"; message: string };
 
-// The provider redirects here with ?code=&state= (or ?error=&error_description=
-// when the admin declined). We hand the code to the gateway, which holds the
-// PKCE verifier, and it stores the resulting tokens for the organization.
+// The single-page variant of the OAuth callback, used when the redirect URI a
+// provider has on file points at the dashboard rather than at the API. The gateway
+// holds the PKCE verifier, so the code is handed straight to it; the resulting
+// tokens are encrypted and stored there and never reach this page.
+//
+// The API-side callback (/api/provider-connections/{provider}/oauth/callback) is the
+// other variant and needs no page at all.
 function CallbackInner() {
   const params = useSearchParams();
   const code = params.get("code");
   const state = params.get("state");
+  // The redirect URI is fixed per provider, so a deployment using this page for more
+  // than one passes ?provider= through it.
+  const provider = params.get("provider") ?? "anthropic";
   const oauthError = params.get("error");
   const oauthErrorDescription = params.get("error_description");
 
@@ -35,14 +42,14 @@ function CallbackInner() {
       setResult({ status: "error", message: "Missing code or state in the callback URL. Start the login again." });
       return;
     }
-    adminApi.finishProviderOAuth(code, state)
+    providerApi.finishOAuth(provider, code, state)
       .then(r => setResult({ status: "ok", expiresAt: r.expiresAt ?? null }))
       .catch(err => setResult({ status: "error", message: errorMessage(err, "The gateway could not complete the login.") }));
-  }, [code, state, oauthError, oauthErrorDescription]);
+  }, [code, state, provider, oauthError, oauthErrorDescription]);
 
   return (
     <div className="w-full max-w-sm rounded-xl border border-neutral-100 bg-white p-8 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-      <h1 className="mb-1 text-lg font-medium">Connecting Claude</h1>
+      <h1 className="mb-1 text-lg font-medium">Connecting {provider}</h1>
       <p className="mb-6 text-sm text-neutral-500">Finishing the browser login for your organization</p>
 
       {result.status === "working" && (
@@ -64,10 +71,10 @@ function CallbackInner() {
 
       {result.status !== "working" && (
         <Link
-          href="/admin/providers"
+          href="/settings/ai-providers"
           className="mt-6 block w-full rounded-lg bg-neutral-900 py-2 text-center text-sm text-white dark:bg-white dark:text-neutral-900"
         >
-          Back to provider credentials
+          Back to AI providers
         </Link>
       )}
     </div>

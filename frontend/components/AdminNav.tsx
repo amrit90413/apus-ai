@@ -4,10 +4,12 @@ import { usePathname } from "next/navigation";
 import { authApi } from "@/lib/api";
 
 const links = [
+  { href: "/admin/ai", label: "AI overview" },
+  { href: "/settings/ai-providers", label: "AI providers" },
+  { href: "/settings/team", label: "Allowances" },
   { href: "/admin/users", label: "Users" },
-  { href: "/admin/team", label: "Team" },
-  { href: "/admin/providers", label: "Providers" },
-  { href: "/usage", label: "Usage" },
+  { href: "/admin/team", label: "Workspaces" },
+  { href: "/usage", label: "My usage" },
 ];
 
 // Minimal top bar shared by the org-admin pages.

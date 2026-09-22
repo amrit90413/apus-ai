@@ -338,3 +338,120 @@ Balance changes are additionally in `token_ledger` with the acting admin
 (`actor_user_id`) and your note (`reference`); usage rows carry the model and
 correlation id. For per-user consumption over time use the dashboard
 (`/admin/users`, 30-day totals from ClickHouse) or `GET /api/v1/admin/users`.
+
+---
+
+# Setting up AI for your team
+
+Seven steps, about ten minutes.
+
+## 1. Create your organization
+
+Sign up at `/register`, or have your platform operator seed the first admin.
+
+## 2. Invite your team
+
+**Users → + New user.** Roles:
+
+| Role | Can do |
+| --- | --- |
+| Member | Use AI, see their own usage |
+| Viewer | Read every dashboard, change nothing |
+| Workspace admin | Allowances, model access, usage export |
+| AI admin | The above plus connect and disconnect providers |
+| Billing admin | Budgets, pricing and spend, but not providers |
+| Org admin | Everything in the organization |
+
+## 3. Connect a provider
+
+**Settings → AI Providers → Connect.** Pick the method for that provider: an
+organization API key, AWS or Google Cloud credentials, or browser login where your
+operator has configured an OAuth client your organization owns.
+
+APUS validates the credential immediately, so you find out now rather than when someone
+hits a failing request. Full details, including what *cannot* be connected and why, are
+in [PROVIDERS.md](PROVIDERS.md).
+
+## 4. Choose which models people can use
+
+**Settings → Team → Manage** per member, or set a tenant-wide list in
+**AI Overview → Settings**. Layers narrow, never widen: platform → tenant → workspace →
+role → member. A member can only reach a model that every layer above allows *and* that
+a connected provider serves — which is why `/v1/models` may be shorter than the list you
+enabled.
+
+## 5. Set the organization budget
+
+**AI Overview → Settings.** Pick your currency, the monthly budget, and a markup if you
+re-bill internally. The budget is a hard ceiling for everyone: once it is exhausted,
+requests are refused with `TENANT_ALLOWANCE_EXCEEDED` until it is raised or the period
+resets.
+
+## 6. Set per-member allowances
+
+**Settings → Team.** Give each person a monthly figure; leave it unset and they draw
+from the shared pool with only the organization budget applying. The page shows what is
+allocated, what is left in the pool, and each person's spend.
+
+```
+Organization budget   ₹50,000
+Allocated to members  ₹20,000
+Remaining shared pool ₹30,000
+
+Aman     ₹1,000/month   used ₹412   remaining ₹588   Sonnet ✓  Opus ✕
+Ravi     ₹500/month     used ₹96    remaining ₹404
+Admin    Unlimited      used ₹1,200                  all models
+```
+
+Also per member, when you need it: a daily sub-limit, requests per minute, tokens per
+minute, concurrent requests, a daily request cap, an access expiry date, and
+suspend/reactivate.
+
+**Top up** adds budget to the current period only. **Reset usage** clears this period's
+consumption as a correction — both are audited, and neither rewrites history.
+
+## 7. People start using it
+
+```bash
+npx apus-ai
+```
+
+Signs them in, mints a personal key and points Claude Code, Cline or Roo Code at the
+gateway. They never see a provider credential. See [CLIENT_SETUP.md](CLIENT_SETUP.md).
+
+## Watching it
+
+- **AI Overview** — budget, spend, margin, latency, failures, breakdowns by provider,
+  member and model, and the daily trend.
+- **Settings → AI Providers** — connection health, this month's traffic and cost per
+  provider, and **Test connection**.
+- **Settings → Team** — per-member spend and remaining.
+
+Notifications go out at 50%, 75%, 90% and 100% of an allowance — to the member for
+their own, and to admins for the organization's — and when a connection needs
+reconnecting. Each fires once per period.
+
+From a terminal:
+
+```bash
+npx apus-ai usage       # your allowance, what's left, reset date
+npx apus-ai models      # what you can use, and which provider serves it
+npx apus-ai providers   # admin: connection states and spend
+```
+
+## When someone is blocked
+
+The error code says which rule stopped them:
+
+| Code | Meaning | Fix |
+| --- | --- | --- |
+| `MODEL_NOT_ALLOWED` | Not on their model list | Settings → Team → Manage |
+| `PROVIDER_NOT_CONNECTED` | Nothing connected serves that model | Settings → AI Providers |
+| `PROVIDER_REAUTHENTICATION_REQUIRED` | The provider rejected the stored credential | Reconnect |
+| `USER_ALLOWANCE_EXCEEDED` | Their monthly budget is spent | Top up, or raise the allowance |
+| `TENANT_ALLOWANCE_EXCEEDED` | The organization budget is spent | Raise it in AI Overview → Settings |
+| `RATE_LIMIT_EXCEEDED` | Too many requests or tokens per minute | Raise their limits, or wait |
+| `USER_AI_ACCESS_DISABLED` | Suspended, disabled, or access expired | Settings → Team → Reactivate |
+
+Raising a limit takes effect on their next request — there is no need to wait for the
+period to roll over.

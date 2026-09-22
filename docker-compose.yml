@@ -60,12 +60,28 @@ services:
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-change-me-min-32-bytes-long-secret-key}
       Encryption__DataKey: ${DATA_ENCRYPTION_KEY:-}
       Anthropic__ApiKey: ${ANTHROPIC_API_KEY:-}   # optional platform-wide fallback
+      Encryption__Keys__2: ${DATA_ENCRYPTION_KEY_V2:-}
+      Encryption__CurrentKeyVersion: ${DATA_ENCRYPTION_CURRENT_VERSION:-0}
+      # Legacy Anthropic OAuth section (still honoured).
       Anthropic__OAuth__ClientId: ${ANTHROPIC_OAUTH_CLIENT_ID:-}
       Anthropic__OAuth__ClientSecret: ${ANTHROPIC_OAUTH_CLIENT_SECRET:-}
       Anthropic__OAuth__AuthorizeUrl: ${ANTHROPIC_OAUTH_AUTHORIZE_URL:-}
       Anthropic__OAuth__TokenUrl: ${ANTHROPIC_OAUTH_TOKEN_URL:-}
       Anthropic__OAuth__Scopes: ${ANTHROPIC_OAUTH_SCOPES:-}
       Anthropic__OAuth__RedirectUri: ${ANTHROPIC_OAUTH_REDIRECT_URI:-}
+      # Per-provider OAuth clients. Takes precedence over the legacy section.
+      Providers__OAuth__anthropic__ClientId: ${PROVIDER_OAUTH_ANTHROPIC_CLIENT_ID:-}
+      Providers__OAuth__anthropic__ClientSecret: ${PROVIDER_OAUTH_ANTHROPIC_CLIENT_SECRET:-}
+      Providers__OAuth__anthropic__AuthorizeUrl: ${PROVIDER_OAUTH_ANTHROPIC_AUTHORIZE_URL:-}
+      Providers__OAuth__anthropic__TokenUrl: ${PROVIDER_OAUTH_ANTHROPIC_TOKEN_URL:-}
+      Providers__OAuth__anthropic__RevokeUrl: ${PROVIDER_OAUTH_ANTHROPIC_REVOKE_URL:-}
+      Providers__OAuth__anthropic__Scopes: ${PROVIDER_OAUTH_ANTHROPIC_SCOPES:-}
+      Providers__OAuth__anthropic__RedirectUri: ${PROVIDER_OAUTH_ANTHROPIC_REDIRECT_URI:-}
+      Providers__OAuth__anthropic__CompletionPath: "/settings/ai-providers"
+      Billing__DefaultCurrency: ${BILLING_DEFAULT_CURRENCY:-USD}
+      Billing__UsdRates__INR: ${BILLING_USD_RATE_INR:-83}
+      Billing__DefaultMarkupBps: ${BILLING_DEFAULT_MARKUP_BPS:-0}
+      Features__Flags__AI_PROVIDER_FALLBACK__Enabled: ${FEATURE_AI_PROVIDER_FALLBACK:-false}
       Registration__Enabled: ${REGISTRATION_ENABLED:-false}
       Registration__InviteCode: ${REGISTRATION_INVITE_CODE:-}
       WhatsApp__Enabled: ${WHATSAPP_ENABLED:-true}

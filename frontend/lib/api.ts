@@ -462,6 +462,280 @@ export const adminApi = {
     del(`/v1/admin/workspaces/${wsId}/members/${userId}`),
 };
 
+
+// ---------------------------------------------------------------------------
+// Multi-provider connections, currency allowances and the AI dashboards.
+// Money always crosses the wire as an integer count of minor units (paise,
+// cents) plus its currency — never as a float.
+// ---------------------------------------------------------------------------
+
+export type ConnectionType = "api_key" | "oauth" | "aws_bedrock" | "google_vertex";
+
+export type ConnectionStatus =
+  | "disconnected" | "connecting" | "connected" | "refreshing"
+  | "expired" | "reauthentication_required" | "revoked" | "disabled" | "error";
+
+export interface ProviderConnection {
+  id: string;
+  organizationId: string | null;
+  provider: string;
+  providerDisplayName: string;
+  connectionType: ConnectionType;
+  status: ConnectionStatus;
+  connectionPurpose: string;
+  displayName: string | null;
+  /** Last four characters, an access key id or a service-account email — never the secret. */
+  hint: string;
+  providerAccountId: string | null;
+  providerOrganizationId: string | null;
+  config: Record<string, string>;
+  scopes: string | null;
+  encryptionKeyVersion: number;
+  connectedByUserId: string | null;
+  connectedAt: string;
+  accessExpiresAt: string | null;
+  lastValidatedAt: string | null;
+  lastRefreshedAt: string | null;
+  revokedAt: string | null;
+  failureCount: number;
+  lastFailureAt: string | null;
+  lastFailureReason: string | null;
+}
+
+export interface ProviderDescriptor {
+  id: string;
+  displayName: string;
+  connectionTypes: ConnectionType[];
+  oauthAvailable: boolean;
+  requiredConfig: string[];
+  docsUrl: string;
+}
+
+export interface ProviderConnectionsResult {
+  connections: ProviderConnection[];
+  /** Legacy alias kept so an older dashboard build keeps rendering. */
+  credentials: ProviderConnection[];
+  providers: ProviderDescriptor[];
+  oauth: { enabled: boolean; provider: string };
+  features: Record<string, boolean>;
+}
+
+export interface ConnectProviderBody {
+  connectionType: ConnectionType;
+  apiKey?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  sessionToken?: string;
+  region?: string;
+  serviceAccountJson?: string;
+  project?: string;
+  location?: string;
+  displayName?: string;
+}
+
+export interface ConnectResult {
+  id: string;
+  status: ConnectionStatus;
+  hint: string;
+  validated: boolean;
+  message: string;
+  connection: ProviderConnection | null;
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  message: string;
+  connection: ProviderConnection | null;
+}
+
+export interface ProviderUsageRow {
+  provider: string;
+  displayName: string;
+  connection: ProviderConnection | null;
+  today: { requests: number; tokens: number; costMinor: number };
+  month: {
+    requests: number; tokens: number;
+    customerCostMinor: number; providerCostMinor: number;
+    failures: number; rateLimited: number;
+  };
+}
+
+export interface ProviderUsageResult { currency: string; providers: ProviderUsageRow[] }
+
+export interface TeamMemberRow {
+  userId: string;
+  email: string;
+  workspaceId: string;
+  membershipId: string;
+  role: string;
+  isActive: boolean;
+  aiStatus: "active" | "suspended" | "disabled";
+  accessExpiresAt: string | null;
+  currency: string;
+  unlimited: boolean;
+  monthlyAllowanceMinor: number | null;
+  dailyAllowanceMinor: number | null;
+  budgetMinor: number;
+  consumedMinor: number;
+  reservedMinor: number;
+  remainingMinor: number | null;
+  requests: number;
+  tokens: number;
+  tokenBalance: number | null;
+  limits: { rpm: number | null; tpm: number | null; concurrency: number | null; dailyRequests: number | null };
+  allowedModels: string[];
+  allowedProviders: string[];
+}
+
+export interface TeamResult {
+  currency: string;
+  period: { start: string; end: string };
+  organization: { monthlyBudgetMinor: number | null; unlimited: boolean; allocatedToMembersMinor: number };
+  users: TeamMemberRow[];
+}
+
+export interface AiOverviewResult {
+  currency: string;
+  period: { start: string; end: string };
+  budget: {
+    unlimited: boolean;
+    budgetMinor: number;
+    consumedMinor: number;
+    reservedMinor: number;
+    remainingMinor: number | null;
+  };
+  totals: {
+    requests: number; tokens: number;
+    customerCostMinor: number; providerCostMinor: number; marginMinor: number;
+    avgLatencyMs: number; failures: number; blocked: number;
+  };
+  providers: { provider: string; customerCostMinor: number; providerCostMinor: number; requests: number; tokens: number }[];
+  models: { provider: string; model: string; customerCostMinor: number; requests: number; tokens: number }[];
+  users: { userId: string; email: string; customerCostMinor: number; requests: number; tokens: number }[];
+}
+
+export interface AiTrendResult {
+  currency: string;
+  days: number;
+  daily: { date: string; requests: number; tokens: number; customerCostMinor: number; providerCostMinor: number }[];
+}
+
+export interface AiSettings {
+  currency: string;
+  monthlyBudgetMinor: number | null;
+  unlimitedBudget: boolean;
+  markupBps: number;
+  aiEnabled: boolean;
+  allowedProviders: string[];
+  allowedModels: string[];
+  features: Record<string, boolean>;
+}
+
+export interface MyAiResult {
+  currency: string;
+  allowance: {
+    unlimited: boolean;
+    budgetMinor: number;
+    usedMinor: number;
+    reservedMinor: number;
+    remainingMinor: number | null;
+    periodStart: string;
+    resetsAt: string;
+  };
+  usage: { requests: number; tokens: number };
+  tokenBalance: { enforced: boolean; remaining: number | null };
+  access: { status: string; expiresAt: string | null; organizationAiEnabled: boolean };
+  limits: { rpm: number | null; tpm: number | null; concurrency: number | null; dailyRequests: number | null };
+  models: { id: string; providers: string[] }[];
+}
+
+export const providerApi = {
+  list: () => get<ProviderConnectionsResult>("/v1/provider-connections"),
+  connect: (provider: string, body: ConnectProviderBody) =>
+    post<ConnectResult>(`/v1/provider-connections/${provider}/connect`, body),
+  startOAuth: (provider: string) =>
+    post<OAuthStartResult>(`/v1/provider-connections/${provider}/oauth/start`, {}),
+  finishOAuth: (provider: string, code: string, state: string) =>
+    post<OAuthFinishResult>(`/v1/provider-connections/${provider}/oauth/callback`, { code, state }),
+  validate: (id: string) => post<ConnectionTestResult>(`/v1/provider-connections/${id}/validate`, {}),
+  disconnect: (id: string) => post<{ id: string; status: string }>(`/v1/provider-connections/${id}/disconnect`, {}),
+  setEnabled: (id: string, enabled: boolean) =>
+    post<{ id: string; status: string }>(`/v1/provider-connections/${id}/${enabled ? "enable" : "disable"}`, {}),
+};
+
+export const aiAdminApi = {
+  overview: () => get<AiOverviewResult>("/v1/admin/ai/overview"),
+  trend: (days = 30) => get<AiTrendResult>(`/v1/admin/ai/usage?days=${days}`),
+  providers: () => get<ProviderUsageResult>("/v1/admin/ai/providers"),
+  settings: () => get<AiSettings>("/v1/admin/ai/settings"),
+  updateSettings: (body: Partial<{
+    currency: string; monthlyBudgetMinor: number | null; unlimitedBudget: boolean;
+    markupBps: number; aiEnabled: boolean; allowedProviders: string[]; allowedModels: string[];
+  }>) => put<AiSettings>("/v1/admin/ai/settings", body),
+
+  team: () => get<TeamResult>("/v1/admin/ai/users"),
+  setAllowance: (userId: string, body: { monthlyMinor: number | null; dailyMinor?: number | null; unlimited?: boolean; note?: string }, workspaceId?: string) =>
+    put<unknown>(`/v1/admin/ai/users/${userId}/allowance${wsQuery(workspaceId)}`, body),
+  topUp: (userId: string, amountMinor: number, note?: string, workspaceId?: string) =>
+    post<unknown>(`/v1/admin/ai/users/${userId}/allowance/top-up${wsQuery(workspaceId)}`, { amountMinor, note }),
+  resetAllowance: (userId: string, workspaceId?: string) =>
+    post<unknown>(`/v1/admin/ai/users/${userId}/allowance/reset${wsQuery(workspaceId)}`, {}),
+  setLimits: (userId: string, body: { rpm?: number | null; tpm?: number | null; concurrency?: number | null; dailyRequests?: number | null }, workspaceId?: string) =>
+    put<unknown>(`/v1/admin/ai/users/${userId}/limits${wsQuery(workspaceId)}`, body),
+  setAccess: (userId: string, body: { allowedModels?: string[]; allowedProviders?: string[] }, workspaceId?: string) =>
+    put<unknown>(`/v1/admin/ai/users/${userId}/models${wsQuery(workspaceId)}`, body),
+  suspend: (userId: string, workspaceId?: string) =>
+    post<unknown>(`/v1/admin/ai/users/${userId}/suspend${wsQuery(workspaceId)}`, {}),
+  reactivate: (userId: string, workspaceId?: string) =>
+    post<unknown>(`/v1/admin/ai/users/${userId}/reactivate${wsQuery(workspaceId)}`, {}),
+};
+
+export const myAiApi = {
+  summary: () => get<MyAiResult>("/v1/me/ai"),
+};
+
+const CURRENCY_SYMBOLS: Record<string, string> = { USD: "$", INR: "\u20b9", EUR: "\u20ac", GBP: "\u00a3", JPY: "\u00a5" };
+const ZERO_DECIMAL = new Set(["JPY", "KRW"]);
+
+/** Formats an integer count of minor units as the currency a human reads. */
+export function money(minor: number | null | undefined, currency = "USD"): string {
+  if (minor === null || minor === undefined) return "\u2014";
+  const code = currency.toUpperCase();
+  const exponent = ZERO_DECIMAL.has(code) ? 0 : 2;
+  const symbol = CURRENCY_SYMBOLS[code] ?? `${code} `;
+  const value = minor / 10 ** exponent;
+  return symbol + value.toLocaleString(undefined, { minimumFractionDigits: exponent, maximumFractionDigits: exponent });
+}
+
+/** Parses a human-typed amount into minor units. Returns null for anything unusable. */
+export function toMinor(input: string, currency = "USD"): number | null {
+  const trimmed = input.trim().replace(/,/g, "");
+  if (!trimmed || !/^\d*\.?\d*$/.test(trimmed)) return null;
+  const exponent = ZERO_DECIMAL.has(currency.toUpperCase()) ? 0 : 2;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? Math.round(value * 10 ** exponent) : null;
+}
+
+/** Minor units back to a plain editable string ("100000" -> "1000"). */
+export function fromMinor(minor: number | null | undefined, currency = "USD"): string {
+  if (minor === null || minor === undefined) return "";
+  const exponent = ZERO_DECIMAL.has(currency.toUpperCase()) ? 0 : 2;
+  return String(minor / 10 ** exponent);
+}
+
+/** "in 12m" / "in 3h" / "in 2d" / "expired" for an ISO timestamp. */
+export function relativeTime(iso: string | null): string {
+  if (!iso) return "never";
+  const ms = new Date(iso).getTime() - Date.now();
+  if (Number.isNaN(ms)) return "unknown";
+  const past = ms < 0;
+  const mins = Math.round(Math.abs(ms) / 60_000);
+  const label = mins < 60 ? `${Math.max(1, mins)}m`
+    : mins < 2880 ? `${Math.round(mins / 60)}h`
+    : `${Math.round(mins / 1440)}d`;
+  return past ? `${label} ago` : `in ${label}`;
+}
+
 export function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`;

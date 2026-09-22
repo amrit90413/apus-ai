@@ -32,13 +32,22 @@ public sealed class WhatsAppGatewayClient
     }
 
     /// <summary>Returns true only when the gateway accepted the message.</summary>
-    public async Task<bool> SendOtpAsync(string phoneNumber, string otp, CancellationToken ct = default)
+    public Task<bool> SendOtpAsync(string phoneNumber, string otp, CancellationToken ct = default)
     {
         var message =
             $"🔐 *YourCompany AI*\n\n" +
             $"Your login OTP is: *{otp}*\n\n" +
             $"Valid for 5 minutes. Do not share this code.";
+        return SendAsync(phoneNumber, message, ct);
+    }
 
+    /// <summary>
+    /// Sends an arbitrary message through the same bot. Used by the notification
+    /// worker for allowance and connection alerts, so both paths share one client,
+    /// one timeout and one failure story.
+    /// </summary>
+    public async Task<bool> SendAsync(string phoneNumber, string message, CancellationToken ct = default)
+    {
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{_opt.BotUrl}/send-message");
         req.Headers.Add("x-api-key", _opt.ApiKey);
         req.Content = JsonContent.Create(new { number = phoneNumber, message });

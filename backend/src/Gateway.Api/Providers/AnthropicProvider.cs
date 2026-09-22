@@ -23,13 +23,13 @@ public sealed class AnthropicProvider : IAiProvider
 {
     private readonly HttpClient _http;
     private readonly AnthropicOptions _opt;
-    private readonly IProviderCredentialService _credentials;
+    private readonly IProviderConnectionService _connections;
 
-    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt, IProviderCredentialService credentials)
+    public AnthropicProvider(HttpClient http, IOptions<AnthropicOptions> opt, IProviderConnectionService connections)
     {
         _http = http;
         _opt = opt.Value;
-        _credentials = credentials;
+        _connections = connections;
     }
 
     public string Name => "anthropic";
@@ -39,10 +39,12 @@ public sealed class AnthropicProvider : IAiProvider
         ChatRequest request,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        // Org credential (API key or OAuth) > platform credential > env var. Stored
-        // credentials win so admins can rotate without redeploying.
-        var auth = await _credentials.ResolveAsync(request.OrganizationId, Name, ct)
-            ?? (string.IsNullOrWhiteSpace(_opt.ApiKey) ? null : new ProviderAuth(AuthScheme.ApiKey, _opt.ApiKey, Guid.Empty));
+        // Org connection (API key or OAuth) > platform connection > env var. Stored
+        // connections win so admins can rotate without redeploying.
+        var connection = await _connections.ResolveAsync(request.OrganizationId, Name, ct);
+        var auth = connection is not null
+            ? new ProviderAuth(ProviderEndpoints.SchemeFor(connection), connection.Secret, connection.ConnectionId)
+            : string.IsNullOrWhiteSpace(_opt.ApiKey) ? null : new ProviderAuth(AuthScheme.ApiKey, _opt.ApiKey, Guid.Empty);
         if (auth is null) throw new ProviderNotConfiguredException(Name);
 
         var system = request.Messages.FirstOrDefault(m => m.Role == "system")?.Content;
@@ -58,16 +60,18 @@ public sealed class AnthropicProvider : IAiProvider
         };
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{_opt.BaseUrl}/v1/messages");
-        ProviderCredentialService.ApplyAuth(req, auth.Scheme, auth.Secret);
+        ProviderConnectionService.ApplyAuth(req, auth.Scheme, auth.Secret);
         req.Headers.Add("anthropic-version", _opt.Version);
         req.Content = JsonContent.Create(body);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
         {
-            // Revoked/rotated upstream. Drop the cached auth so the next request re-reads
-            // (and, for OAuth, re-refreshes) instead of failing for the cache lifetime.
-            _credentials.Invalidate(request.OrganizationId, Name);
+            // Revoked/rotated upstream. Record it against the connection and drop the
+            // cached auth so the next request re-reads instead of failing for the cache
+            // lifetime.
+            await _connections.ReportFailureAsync(auth.CredentialId, (int)resp.StatusCode, "provider rejected the credential", CancellationToken.None);
+            _connections.Invalidate(request.OrganizationId, Name);
             throw new ProviderAuthException(Name, (int)resp.StatusCode);
         }
         resp.EnsureSuccessStatusCode();
