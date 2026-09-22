@@ -14,5 +14,7 @@ COPY --from=build /app .
 USER appuser
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
-HEALTHCHECK --interval=15s --timeout=3s --retries=3 CMD wget -qO- http://localhost:8080/health/live || exit 1
+# The aspnet image ships neither wget nor curl; bash's /dev/tcp is enough for a
+# liveness probe and keeps the image free of extra packages.
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 CMD ["bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/live HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
 ENTRYPOINT ["dotnet", "Gateway.Api.dll"]
