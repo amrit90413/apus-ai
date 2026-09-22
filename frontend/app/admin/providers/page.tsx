@@ -36,6 +36,70 @@ function relative(iso: string): string {
   return `in ${Math.round(hours / 24)}d`;
 }
 
+/**
+ * First-run connection chooser. Mirrors the shape of a login method picker: the
+ * admin connects one credential and every user in the org routes through it.
+ *
+ * A personal Claude.ai subscription is deliberately absent. Consumer Pro/Max
+ * plans authenticate Anthropic's own surfaces, not third-party gateways, and
+ * fanning one out across a team is subscription sharing — see docs/ADMIN_GUIDE.md.
+ */
+function ConnectChooser({
+  oauthEnabled,
+  connecting,
+  onAddKey,
+  onConnect,
+}: {
+  oauthEnabled: boolean;
+  connecting: boolean;
+  onAddKey: () => void;
+  onConnect: () => void;
+}) {
+  return (
+    <div className="rounded-lg border border-neutral-200 p-6 dark:border-neutral-800">
+      <h2 className="text-sm font-medium">Connect a provider account</h2>
+      <p className="mt-1 mb-5 text-xs text-neutral-400">
+        Your users do not connect anything themselves — they authenticate to this gateway and
+        their usage is metered against the credential you connect here.
+      </p>
+
+      <div className="space-y-3">
+        <button
+          type="button"
+          onClick={onAddKey}
+          className="w-full rounded-md bg-neutral-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-neutral-900"
+        >
+          Anthropic Console API key
+        </button>
+        <p className="-mt-1.5 text-xs text-neutral-400">
+          Recommended. Use a service-account key owned by your organization, billed through Console.
+        </p>
+
+        <button
+          type="button"
+          onClick={onConnect}
+          disabled={!oauthEnabled || connecting}
+          title={oauthEnabled ? undefined : "No OAuth client configured for this deployment"}
+          className="w-full rounded-md border border-neutral-200 px-4 py-2.5 text-sm font-medium hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-900"
+        >
+          {connecting ? "Redirecting…" : "Connect with browser login"}
+        </button>
+        <p className="-mt-1.5 text-xs text-neutral-400">
+          {oauthEnabled
+            ? "Sign in to the provider account that belongs to your organization."
+            : "Unavailable — needs an OAuth client issued to your organization. Set Anthropic:OAuth ClientId, AuthorizeUrl, TokenUrl and RedirectUri, then restart the gateway."}
+        </p>
+      </div>
+
+      <p className="mt-5 border-t border-neutral-100 pt-4 text-xs text-neutral-400 dark:border-neutral-800">
+        A personal Claude Pro or Max subscription cannot be connected here. Those plans sign in to
+        Anthropic&apos;s own apps, not third-party gateways, and sharing one across a team breaks
+        Anthropic&apos;s terms. Use a Console key, or an OAuth client issued to your organization.
+      </p>
+    </div>
+  );
+}
+
 export default function AdminProvidersPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const loader = useCallback(() => adminApi.listProviderCredentials(), [refreshKey]);
@@ -126,16 +190,17 @@ export default function AdminProvidersPage() {
           <p className="text-xs text-neutral-400">Org admin · the Claude connection your users go through</p>
         </div>
         <div className="flex gap-2">
-          {oauthEnabled && (
-            <button
-              type="button"
-              onClick={handleConnect}
-              disabled={connecting}
-              className="rounded-md border border-neutral-200 px-3 py-1.5 text-sm hover:bg-neutral-50 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-900"
-            >
-              {connecting ? "Redirecting…" : "Connect with browser login"}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={handleConnect}
+            disabled={!oauthEnabled || connecting}
+            title={oauthEnabled
+              ? "Sign in to your organization's provider account"
+              : "No OAuth client configured — set Anthropic:OAuth in the gateway config"}
+            className="rounded-md border border-neutral-200 px-3 py-1.5 text-sm hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-900"
+          >
+            {connecting ? "Redirecting…" : "Connect with browser login"}
+          </button>
           <button
             type="button"
             onClick={() => { setShowForm(v => !v); setFormError(null); }}
@@ -194,9 +259,19 @@ export default function AdminProvidersPage() {
       {!credentials ? (
         <p className="text-sm text-neutral-400">Loading credentials…</p>
       ) : credentials.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-neutral-200 p-4 text-sm text-neutral-400 dark:border-neutral-700">
-          No credential connected — users will get provider_not_configured until you add one (a platform-wide fallback key may apply).
-        </p>
+        <>
+          <p className="mb-4 rounded-lg border border-dashed border-neutral-200 p-4 text-sm text-neutral-400 dark:border-neutral-700">
+            No credential connected — users will get provider_not_configured until you add one (a platform-wide fallback key may apply).
+          </p>
+          {!showForm && (
+            <ConnectChooser
+              oauthEnabled={oauthEnabled}
+              connecting={connecting}
+              onAddKey={() => { setShowForm(true); setFormError(null); }}
+              onConnect={handleConnect}
+            />
+          )}
+        </>
       ) : (
         <table className="w-full text-sm">
           <thead className="text-left text-neutral-400">
