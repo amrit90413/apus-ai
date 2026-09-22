@@ -4,6 +4,7 @@ using Gateway.Api.Domain;
 using Gateway.Api.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 namespace Gateway.Api.Auth;
@@ -22,15 +23,17 @@ public sealed class AuthController : ControllerBase
     private readonly TokenService _tokens;
     private readonly JwtOptions _jwt;
     private readonly OtpService _otp;
+    private readonly WhatsAppOptions _whatsapp;
     private readonly ILogger<AuthController> _log;
 
     public AuthController(GatewayDbContext db, TokenService tokens, JwtOptions jwt,
-        OtpService otp, ILogger<AuthController> log)
+        OtpService otp, WhatsAppOptions whatsapp, ILogger<AuthController> log)
     {
-        _db = db; _tokens = tokens; _jwt = jwt; _otp = otp; _log = log;
+        _db = db; _tokens = tokens; _jwt = jwt; _otp = otp; _whatsapp = whatsapp; _log = log;
     }
 
     [HttpPost("login")]
+    [EnableRateLimiting("auth")]
     public async Task<IActionResult> Login([FromBody] LoginRequest req, CancellationToken ct)
     {
         var user = await _db.Users.IgnoreQueryFilters()
@@ -47,13 +50,21 @@ public sealed class AuthController : ControllerBase
         if (membership is null)
             return Unauthorized(new { error = new { code = "no_workspace", message = "User has no workspace membership." } });
 
-        // Admin and SuperAdmin must verify via WhatsApp OTP before receiving a JWT.
-        if (membership.Role >= Role.OrgAdmin)
+        // Admin and SuperAdmin must verify via WhatsApp OTP before receiving a JWT,
+        // unless no OTP gateway is configured for this deployment.
+        if (membership.Role >= Role.OrgAdmin && _whatsapp.Enabled)
         {
             if (string.IsNullOrWhiteSpace(user.PhoneNumber))
                 return UnprocessableEntity(new { error = new { code = "no_phone", message = "Admin account has no phone number. Contact your super admin." } });
 
             var pendingToken = await _otp.SendOtpAsync(user, ct);
+            if (pendingToken is null)
+            {
+                // Better a clear failure than a pending token nothing can complete.
+                await Audit(user.OrganizationId, user.Id, "otp_delivery_failed", $"device={req.DeviceName}");
+                return StatusCode(502, new { error = new { code = "otp_delivery_failed", message = "Could not deliver the OTP. Contact your super admin." } });
+            }
+
             await Audit(user.OrganizationId, user.Id, "otp_sent", $"device={req.DeviceName}");
 
             return Accepted(new OtpPendingResponse(
@@ -62,11 +73,16 @@ public sealed class AuthController : ControllerBase
                 Message: $"OTP sent to WhatsApp number ending in {user.PhoneNumber[^4..]}"));
         }
 
+        if (membership.Role >= Role.OrgAdmin)
+            await Audit(user.OrganizationId, user.Id, "admin_login_without_otp",
+                $"device={req.DeviceName} reason=whatsapp_disabled");
+
         // Regular users and workspace admins get a JWT immediately.
         return await IssueSession(user, membership, req.DeviceName);
     }
 
     [HttpPost("verify-otp")]
+    [EnableRateLimiting("auth")]
     public async Task<IActionResult> VerifyOtp([FromBody] VerifyOtpRequest req, CancellationToken ct)
     {
         var userId = await _otp.VerifyOtpAsync(req.PendingToken, req.Otp);

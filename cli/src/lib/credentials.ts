@@ -18,9 +18,9 @@ function getKeytar(): Promise<KeytarLike | null> {
   return keytarPromise;
 }
 
-const SERVICE = "yourcompany-ai";
+const SERVICE = "apus-ai";
 const ACCOUNT = "default";
-const FALLBACK_DIR = join(homedir(), ".yourcompany-ai");
+const FALLBACK_DIR = join(homedir(), ".apus-ai");
 const FALLBACK_FILE = join(FALLBACK_DIR, "credentials.json");
 
 export interface Credentials {
@@ -28,6 +28,9 @@ export interface Credentials {
   accessToken: string;
   refreshToken: string;
   accessExpiresAt: string; // ISO
+  email?: string;          // account the tokens belong to (lets setup offer key reuse safely)
+  apiKey?: string;         // personal proxy key minted by `apus-ai setup` (apus_...)
+  apiKeyPrefix?: string;   // display-safe prefix of apiKey, as returned by the gateway
 }
 
 // Prefer the OS keychain (Keychain / libsecret / Credential Vault). Fall back to a
@@ -40,7 +43,7 @@ export async function saveCredentials(creds: Credentials): Promise<void> {
     await kt.setPassword(SERVICE, ACCOUNT, payload);
   } catch {
     await mkdir(FALLBACK_DIR, { recursive: true });
-    await writeFile(FALLBACK_FILE, payload, "utf8");
+    await writeFile(FALLBACK_FILE, payload, { encoding: "utf8", mode: 0o600 });
     await chmod(FALLBACK_FILE, 0o600);
   }
 }
@@ -52,7 +55,8 @@ export async function loadCredentials(): Promise<Credentials | null> {
     if (raw) return JSON.parse(raw);
   } catch { /* fall through to file */ }
   try {
-    return JSON.parse(await readFile(FALLBACK_FILE, "utf8"));
+    const raw = await readFile(FALLBACK_FILE, "utf8");
+    return raw.trim() ? JSON.parse(raw) : null;
   } catch {
     return null;
   }
@@ -73,11 +77,12 @@ export async function getValidAccessToken(creds: Credentials): Promise<string> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ refreshToken: creds.refreshToken }),
   });
-  if (!res.ok) throw new Error("Session expired. Run `yourcompany-ai login` again.");
+  if (!res.ok) throw new Error("Session expired. Run `apus-ai login` again.");
 
   const data = (await res.json()) as {
     accessToken: string; refreshToken: string; accessExpiresAt: string;
   };
+  // The refresh token rotates on every call — persist the new pair immediately.
   const updated: Credentials = { ...creds, ...data };
   await saveCredentials(updated);
   return updated.accessToken;
@@ -88,7 +93,7 @@ export async function getValidAccessToken(creds: Credentials): Promise<string> {
 export async function requireCredentials(): Promise<Credentials> {
   const creds = await loadCredentials();
   if (!creds) {
-    console.error("Not logged in. Run `yourcompany-ai login`.");
+    console.error("Not logged in. Run `npx apus-ai` (setup) or `apus-ai login`.");
     process.exit(1);
   }
   return creds;

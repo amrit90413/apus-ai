@@ -1,7 +1,7 @@
 import "./globals.css";
 import type { ReactNode } from "react";
 
-export const metadata = { title: "YourCompany AI — Admin", description: "AI gateway dashboards" };
+export const metadata = { title: "apus-ai", description: "AI gateway dashboards" };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (

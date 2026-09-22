@@ -1,44 +1,210 @@
 // Thin typed client for the gateway admin API. The dashboard authenticates with
-// the same JWT the CLI uses (stored in an httpOnly cookie set by the web login).
+// the same JWT the CLI uses, held in localStorage and refreshed transparently.
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "/api";
 
-function authHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  const token = localStorage.getItem("access_token");
-  return token ? { Authorization: `Bearer ${token}` } : {};
+const ACCESS_KEY = "access_token";
+const REFRESH_KEY = "refresh_token";
+const EXPIRES_KEY = "access_expires_at";
+
+// Refresh this far ahead of expiry so an in-flight request can't straddle it.
+const REFRESH_SKEW_MS = 60_000;
+
+export class SessionExpiredError extends Error {
+  constructor() { super("Session expired"); this.name = "SessionExpiredError"; }
+}
+
+/**
+ * A non-2xx response from the gateway. `code` is the server's snake_case error
+ * code (`{ error: { code, message } }`) when the body carried one, otherwise
+ * `http_<status>`; `message` is the server's human text when present.
+ */
+export class ApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function toApiError(res: Response, path: string): Promise<ApiError> {
+  let code = `http_${res.status}`;
+  let message = `${res.status} ${path}`;
+  try {
+    const body = (await res.json()) as { error?: { code?: string; message?: string } } | null;
+    if (body?.error?.code) code = body.error.code;
+    if (body?.error?.message) message = body.error.message;
+  } catch { /* empty or non-JSON body: keep the generic message */ }
+  return new ApiError(res.status, code, message);
+}
+
+function store(tokens: LoginResult): void {
+  localStorage.setItem(ACCESS_KEY, tokens.accessToken);
+  localStorage.setItem(REFRESH_KEY, tokens.refreshToken);
+  localStorage.setItem(EXPIRES_KEY, tokens.accessExpiresAt);
+}
+
+// Pages that work without a session; never bounce these to /login.
+const PUBLIC_PATHS = new Set(["/login", "/register"]);
+
+function endSession(): SessionExpiredError {
+  localStorage.removeItem(ACCESS_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(EXPIRES_KEY);
+  // usePolling swallows rejections, so without this the dashboard would sit on
+  // stale data instead of showing the user they have been signed out.
+  if (typeof window !== "undefined" && !PUBLIC_PATHS.has(window.location.pathname))
+    window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
+  return new SessionExpiredError();
+}
+
+// The gateway rotates the refresh token on every use, so two concurrent refreshes
+// would leave the second holding a hash the server has already replaced. Every
+// caller therefore shares one in-flight request.
+let refreshInFlight: Promise<string> | null = null;
+
+function refreshAccessToken(): Promise<string> {
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    const refreshToken = localStorage.getItem(REFRESH_KEY);
+    if (!refreshToken) throw endSession();
+
+    let res: Response;
+    try {
+      res = await fetch(`${API}/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken }),
+      });
+    } catch {
+      // Network blip: keep the session and let the caller retry on the next poll.
+      throw new Error("Could not reach the gateway to refresh the session.");
+    }
+
+    if (!res.ok) throw endSession();
+
+    const tokens = (await res.json()) as LoginResult;
+    store(tokens);
+    return tokens.accessToken;
+  })();
+
+  return refreshInFlight.finally(() => { refreshInFlight = null; });
+}
+
+/** Returns a usable access token, refreshing when it is within the skew of expiry. */
+export async function getValidAccessToken(force = false): Promise<string | null> {
+  if (typeof window === "undefined") return null;
+
+  const token = localStorage.getItem(ACCESS_KEY);
+  if (!token) return null;
+  if (force) return refreshAccessToken();
+
+  const expiresAt = localStorage.getItem(EXPIRES_KEY);
+  // A session stored before expiry tracking existed: refresh once to learn it.
+  if (!expiresAt) return refreshAccessToken();
+
+  const msLeft = new Date(expiresAt).getTime() - Date.now();
+  if (Number.isNaN(msLeft)) return refreshAccessToken();
+
+  return msLeft > REFRESH_SKEW_MS ? token : refreshAccessToken();
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<Response> {
+  const send = async (token: string | null) =>
+    fetch(`${API}${path}`, {
+      ...init,
+      credentials: "include",
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+
+  // No session at all: don't fire an unauthenticated request every poll tick —
+  // send the visitor to sign in immediately.
+  if (typeof window !== "undefined" && !localStorage.getItem(ACCESS_KEY)) throw endSession();
+
+  let res = await send(await getValidAccessToken());
+
+  // Still rejected with a token we believed was valid — the session may have been
+  // revoked, or the gateway restarted. Force one refresh and retry exactly once.
+  if (res.status === 401 && localStorage.getItem(ACCESS_KEY)) {
+    res = await send(await getValidAccessToken(true));
+  }
+
+  if (!res.ok) throw await toApiError(res, path);
+  return res;
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    credentials: "include",
-    headers: authHeaders(),
+  const res = await request<T>(path);
+  return res.json() as Promise<T>;
+}
+
+async function sendJson<T>(method: "POST" | "PUT" | "PATCH", path: string, body: unknown): Promise<T> {
+  const res = await request<T>(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
   return res.json() as Promise<T>;
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
-  return res.json() as Promise<T>;
+  return sendJson<T>("POST", path, body);
+}
+
+async function put<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>("PUT", path, body);
+}
+
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>("PATCH", path, body);
 }
 
 async function del(path: string): Promise<void> {
-  const res = await fetch(`${API}${path}`, {
-    method: "DELETE",
-    credentials: "include",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  await request<void>(path, { method: "DELETE" });
+}
+
+/** DELETE that returns a JSON body (e.g. the balance endpoints echo the new state). */
+async function delJson<T>(path: string): Promise<T> {
+  const res = await request<T>(path, { method: "DELETE" });
+  return res.json() as Promise<T>;
+}
+
+/** Optional `?workspaceId=` — only needed when the user is in more than one workspace. */
+function wsQuery(workspaceId?: string): string {
+  return workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : "";
+}
+
+// Public (unauthenticated) endpoints share the error shape but must not attach
+// or refresh a JWT, so they bypass `request`.
+async function publicFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${API}${path}`, init);
+  if (!res.ok) throw await toApiError(res, path);
+  return res.json() as Promise<T>;
 }
 
 export interface LoginResult { accessToken: string; refreshToken: string; accessExpiresAt: string; status?: never; }
 export interface OtpPendingResult { status: "otp_required"; pendingToken: string; message: string; }
+
+export interface RegisterAvailability {
+  enabled: boolean;
+  inviteCodeRequired: boolean;
+  phoneRequired: boolean;
+  minPasswordLength: number;
+}
+export interface RegisterRequest {
+  organizationName: string;
+  email: string;
+  password: string;
+  phoneNumber?: string;
+  inviteCode?: string;
+}
+export interface RegisterResult { organizationId: string; slug: string; workspaceId: string; userId: string; next: string; }
 
 export const authApi = {
   login: async (email: string, password: string): Promise<LoginResult | OtpPendingResult> => {
@@ -48,7 +214,7 @@ export const authApi = {
       body: JSON.stringify({ email, password, deviceName: "web" }),
     });
     if (res.status === 202) return res.json() as Promise<OtpPendingResult>;
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw await toApiError(res, "/v1/auth/login");
     return res.json() as Promise<LoginResult>;
   },
   verifyOtp: async (pendingToken: string, otp: string): Promise<LoginResult> => {
@@ -57,16 +223,38 @@ export const authApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pendingToken, otp }),
     });
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw await toApiError(res, "/v1/auth/verify-otp");
     return res.json() as Promise<LoginResult>;
   },
-  saveToken: (accessToken: string, refreshToken: string) => {
-    localStorage.setItem("access_token", accessToken);
-    localStorage.setItem("refresh_token", refreshToken);
+  // Self-service organization signup. Availability tells the form which fields
+  // the gateway requires; `register` rejects with an ApiError carrying the
+  // server code (email_taken, weak_password, invalid_invite, phone_required...).
+  registerAvailability: () => publicFetch<RegisterAvailability>("/v1/auth/register"),
+  register: (body: RegisterRequest) =>
+    publicFetch<RegisterResult>("/v1/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  saveToken: (tokens: LoginResult) => store(tokens),
+  logout: async () => {
+    const refreshToken = localStorage.getItem(REFRESH_KEY);
+    if (refreshToken) {
+      // Best effort: revoke server-side so the refresh token dies with the session.
+      try {
+        await fetch(`${API}/v1/auth/logout`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refreshToken }),
+        });
+      } catch { /* revoke on the server is best effort; clear locally regardless */ }
+    }
+    endSession();
   },
   clearToken: () => {
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
+    localStorage.removeItem(ACCESS_KEY);
+    localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(EXPIRES_KEY);
   },
 };
 
@@ -77,8 +265,124 @@ export interface WindowState { name: string; used: number; limit: number; resetI
 export interface ProviderKeyRow { id: string; provider: string; keyHint: string; isActive: boolean; createdAt: string; }
 
 export interface UserUsage { inputTokens: number; outputTokens: number; costUsd: number; requests: number; lastActive: string; }
-export interface UserRow { id: string; email: string; phoneNumber?: string; phoneVerified: boolean; isActive: boolean; createdAt: string; role: string; workspaceId?: string; usage?: UserUsage; }
+export interface UserRow {
+  id: string;
+  email: string;
+  phoneNumber?: string;
+  phoneVerified: boolean;
+  isActive: boolean;
+  createdAt: string;
+  role: string;
+  workspaceId?: string;
+  /** Prepaid token allowance; null = unlimited (rolling windows still apply). */
+  tokenBalance: number | null;
+  usage?: UserUsage;
+}
 export interface WorkspaceRow { id: string; name: string; isActive: boolean; memberCount: number; }
+
+// Org-owned provider credentials (the organization's Claude connection).
+export type ProviderCredentialKind = "api_key" | "oauth";
+export interface ProviderCredentialRow {
+  id: string;
+  organizationId: string | null;
+  provider: string;
+  kind: ProviderCredentialKind;
+  hint: string;
+  isActive: boolean;
+  accessExpiresAt: string | null;
+  lastRefreshedAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+}
+export interface ProviderCredentialsResult {
+  credentials: ProviderCredentialRow[];
+  oauth: { enabled: boolean; provider: string };
+}
+export interface OAuthStartResult { authorizeUrl: string; expiresInSeconds: number; }
+export interface OAuthFinishResult { id: string; expiresAt: string | null; }
+export interface CredentialTestResult { ok: boolean; message: string; }
+
+// Prepaid token balance + ledger.
+export type LedgerKind = "grant" | "set" | "usage" | "revoke" | "allowance";
+export interface LedgerEntry {
+  id: number;
+  kind: LedgerKind;
+  delta: number;
+  balanceAfter: number | null;
+  actorUserId: string | null;
+  reference: string | null;
+  createdAt: string;
+}
+/** Recurring top-up. Null on BalanceResult when the user has no allowance. */
+export interface Allowance {
+  tokens: number;
+  rollover: boolean;
+  period: "monthly";
+  /** Last period credited, "YYYY-MM"; null before the first credit. */
+  lastCreditedPeriod: string | null;
+}
+export interface BalanceResult {
+  userId: string;
+  workspaceId: string;
+  membershipId: string;
+  enforced: boolean;
+  balance: number | null;
+  allowance: Allowance | null;
+  history: LedgerEntry[];
+}
+
+// Per-user quota override and the workspace policy it falls back to.
+export interface QuotaOverride { userWindows?: unknown[]; allowedModels?: string[]; }
+export interface EffectiveQuota {
+  allowedModels: string[];
+  userWindows: unknown[];
+  workspaceWindows: unknown[];
+  requestsPerMinute: number;
+}
+export interface UserQuotaResult {
+  userId: string;
+  workspaceId: string;
+  hasOverride: boolean;
+  override: QuotaOverride | null;
+  effective: EffectiveQuota;
+}
+export interface WorkspacePolicy {
+  allowedModels: string[];
+  userWindows: unknown[];
+  workspaceWindows: unknown[];
+  requestsPerMinute: number;
+}
+export interface WorkspacePolicyResult {
+  workspaceId: string;
+  isDefault?: boolean;
+  policy?: WorkspacePolicy;
+  /** Some gateway versions return the policy fields at the top level. */
+  allowedModels?: string[];
+}
+
+// Personal `apus_...` keys a user minted for their IDE clients.
+export interface PersonalKeyRow {
+  id: string;
+  name: string;
+  prefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
+/** Returned once, at creation: `key` is never retrievable again. */
+export interface CreatedPersonalKey extends PersonalKeyRow {
+  key: string;
+}
+
+/** Self-service personal keys for the /v1 proxy. Minting requires a JWT session. */
+export const meApi = {
+  listKeys: () => get<{ keys: PersonalKeyRow[] }>("/v1/me/keys"),
+  createKey: (name: string) => post<CreatedPersonalKey>("/v1/me/keys", { name }),
+  revokeKey: (id: string) => del(`/v1/me/keys/${id}`),
+  models: () => get<{ models: string[] }>("/v1/me/models"),
+};
 
 export const adminApi = {
   // Super-admin: cross-tenant rollup (ClickHouse-backed).
@@ -87,23 +391,64 @@ export const adminApi = {
   // Org-admin: per-employee tracking within a workspace.
   topConsumers: (workspaceId: string) => get<{ consumers: ConsumerRow[]; window: WindowState }>(`/v1/admin/workspaces/${workspaceId}/top-consumers`),
   // User: own usage.
-  myUsage: () => get<{ windows: WindowState[] }>("/v1/me/usage"),
-  // Super-admin: provider API key management.
+  myUsage: () => get<{ windows: WindowState[]; balance?: { enforced: boolean; remaining: number | null } }>("/v1/me/usage"),
+  // Super-admin: platform-wide fallback provider API keys.
   listProviderKeys: () => get<{ keys: ProviderKeyRow[] }>("/v1/admin/provider-keys"),
   addProviderKey: (provider: string, apiKey: string) =>
     post<{ id: string }>("/v1/admin/provider-keys", { provider, apiKey }),
   removeProviderKey: (id: string) => del(`/v1/admin/provider-keys/${id}`),
+
+  // Org-admin: the organization's own provider credential (API key or OAuth).
+  listProviderCredentials: () => get<ProviderCredentialsResult>("/v1/admin/provider-credentials"),
+  addProviderApiKey: (provider: string, apiKey: string) =>
+    post<{ id: string }>("/v1/admin/provider-credentials/api-key", { provider, apiKey }),
+  startProviderOAuth: () =>
+    post<OAuthStartResult>("/v1/admin/provider-credentials/oauth/start", { provider: "anthropic" }),
+  finishProviderOAuth: (code: string, state: string) =>
+    post<OAuthFinishResult>("/v1/admin/provider-credentials/oauth/callback", { code, state }),
+  testProviderCredential: (id: string) =>
+    post<CredentialTestResult>(`/v1/admin/provider-credentials/${id}/test`, {}),
+  removeProviderCredential: (id: string) => del(`/v1/admin/provider-credentials/${id}`),
 
   // Org-admin: user management.
   listUsers: () => get<{ users: UserRow[] }>("/v1/admin/users"),
   createUser: (body: { email: string; password: string; phoneNumber?: string; workspaceId: string; role: string }) =>
     post<{ userId: string; email: string }>("/v1/admin/users", body),
   updateUser: (id: string, body: { isActive?: boolean; role?: string; phoneNumber?: string }) =>
-    post<{ updated: boolean }>(`/v1/admin/users/${id}`, body),
+    patch<{ updated: boolean }>(`/v1/admin/users/${id}`, body),
   revokeUserSessions: (id: string) =>
     post<{ sessionsRevoked: number }>(`/v1/admin/users/${id}/revoke-sessions`, {}),
   getUserActivity: (id: string) =>
     get<{ activity: unknown[] }>(`/v1/admin/users/${id}/activity`),
+
+  // Org-admin: prepaid token balance per user (null = unlimited).
+  getUserBalance: (id: string, workspaceId?: string) =>
+    get<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`),
+  grantTokens: (id: string, body: { tokens: number; note?: string; idempotencyKey?: string }, workspaceId?: string) =>
+    post<BalanceResult>(`/v1/admin/users/${id}/balance/grant${wsQuery(workspaceId)}`, body),
+  setTokens: (id: string, body: { tokens: number; note?: string }, workspaceId?: string) =>
+    put<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`, body),
+  revokeBalance: (id: string, workspaceId?: string) =>
+    delJson<BalanceResult>(`/v1/admin/users/${id}/balance${wsQuery(workspaceId)}`),
+  // Recurring monthly allowance: credits the current period immediately, then renews.
+  setAllowance: (id: string, body: { tokens: number; rollover: boolean; note?: string }, workspaceId?: string) =>
+    put<BalanceResult>(`/v1/admin/users/${id}/balance/allowance${wsQuery(workspaceId)}`, body),
+  clearAllowance: (id: string, workspaceId?: string) =>
+    delJson<BalanceResult>(`/v1/admin/users/${id}/balance/allowance${wsQuery(workspaceId)}`),
+
+  // Org-admin: per-user model allowlist (override of the workspace policy).
+  getUserQuota: (id: string, workspaceId?: string) =>
+    get<UserQuotaResult>(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`),
+  setUserModels: (id: string, allowedModels: string[], workspaceId?: string) =>
+    put<{ userId: string; workspaceId: string; override: QuotaOverride }>(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`, { allowedModels }),
+  clearUserQuota: (id: string, workspaceId?: string) =>
+    del(`/v1/admin/users/${id}/quota${wsQuery(workspaceId)}`),
+  getWorkspacePolicy: (id: string) =>
+    get<WorkspacePolicyResult>(`/v1/admin/workspaces/${id}/policy`),
+
+  // Org-admin: a user's personal gateway keys.
+  listUserKeys: (id: string) => get<{ keys: PersonalKeyRow[] }>(`/v1/admin/users/${id}/keys`),
+  revokeUserKey: (id: string, keyId: string) => del(`/v1/admin/users/${id}/keys/${keyId}`),
 
   // Org-admin: workspace/team management.
   listWorkspaces: () => get<{ workspaces: WorkspaceRow[] }>("/v1/admin/workspaces"),
@@ -123,17 +468,38 @@ export function fmt(n: number): string {
   return n.toString();
 }
 
+/** Human-readable message for a thrown value; prefers the gateway's own text. */
+export function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message || fallback;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 // Poll an async loader every `ms` for "realtime" dashboards without websockets.
+// Stops on errors that a retry cannot fix (signed out, forbidden, endpoint missing)
+// and pauses while the tab is hidden, so an idle dashboard is not a request storm.
 // Swap for a Server-Sent Events subscription in production for sub-second updates.
 import { useEffect, useState } from "react";
 export function usePolling<T>(loader: () => Promise<T>, ms = 5000): T | null {
   const [data, setData] = useState<T | null>(null);
   useEffect(() => {
     let alive = true;
-    const tick = () => loader().then(d => { if (alive) setData(d); }).catch(() => {});
+    let id: ReturnType<typeof setInterval> | null = null;
+    const stop = () => { if (id !== null) { clearInterval(id); id = null; } };
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loader().then(d => { if (alive) setData(d); }).catch((err: unknown) => {
+        if (err instanceof SessionExpiredError) { stop(); return; }
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403 || err.status === 404)) {
+          console.warn(`[polling] ${err.status} ${err.code} — stopped`);
+          stop();
+        }
+        // Network blips and 5xx: keep polling; the next tick may succeed.
+      });
+    };
     tick();
-    const id = setInterval(tick, ms);
-    return () => { alive = false; clearInterval(id); };
+    id = setInterval(tick, ms);
+    return () => { alive = false; stop(); };
   }, [loader, ms]);
   return data;
 }

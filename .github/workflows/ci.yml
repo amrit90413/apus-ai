@@ -12,6 +12,7 @@ jobs:
         with: { dotnet-version: "9.0.x" }
       - run: dotnet restore backend/src/Gateway.Api/Gateway.Api.csproj
       - run: dotnet build backend/src/Gateway.Api/Gateway.Api.csproj -c Release --no-restore
+      - run: dotnet test backend/tests/Gateway.Api.Tests/Gateway.Api.Tests.csproj -c Release
 
   cli:
     runs-on: ubuntu-latest

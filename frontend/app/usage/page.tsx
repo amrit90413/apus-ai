@@ -1,6 +1,7 @@
 "use client";
 import { useCallback } from "react";
 import { adminApi, usePolling } from "@/lib/api";
+import KeysSection from "./keys-section";
 
 // Employee self-service: see your own usage + reset countdown.
 export default function UsagePage() {
@@ -11,7 +12,21 @@ export default function UsagePage() {
   return (
     <div className="mx-auto max-w-2xl p-8">
       <h1 className="mb-6 text-lg font-medium">Your usage</h1>
+      {data.balance?.enforced && (
+        <div className="mb-6 rounded-lg border border-neutral-100 p-4 dark:border-neutral-800">
+          <div className="flex justify-between text-sm">
+            <span className="font-medium">Prepaid balance</span>
+            <span className={(data.balance.remaining ?? 0) <= 0 ? "text-red-600" : "text-neutral-500"}>
+              {(data.balance.remaining ?? 0).toLocaleString()} tokens left
+            </span>
+          </div>
+          {(data.balance.remaining ?? 0) <= 0 && (
+            <p className="mt-1 text-xs text-red-600">Exhausted — ask your admin to add tokens.</p>
+          )}
+        </div>
+      )}
       <div className="space-y-4">
+        {data.windows.length === 0 && <p className="text-sm text-neutral-400">No rolling windows configured.</p>}
         {data.windows.map((w) => {
           const pct = Math.round((w.used / w.limit) * 100);
           const mins = Math.ceil(w.resetInSeconds / 60);
@@ -29,6 +44,7 @@ export default function UsagePage() {
           );
         })}
       </div>
+      <KeysSection />
     </div>
   );
 }

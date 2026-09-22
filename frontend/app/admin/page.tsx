@@ -1,25 +1,43 @@
 "use client";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { adminApi, usePolling, fmt } from "@/lib/api";
+import AdminNav from "@/components/AdminNav";
 
-// Org/workspace admin: the per-employee tracking view (your core need).
+// Org/workspace admin: the per-employee tracking view for one workspace.
 export default function AdminPage() {
-  const workspaceId = "demo-workspace"; // from route param / session in production
-  const loader = useCallback(() => adminApi.topConsumers(workspaceId), [workspaceId]);
-  const data = usePolling(loader, 5000);
-  if (!data) return <div className="p-8 text-neutral-500">Loading workspace…</div>;
+  const wsLoader = useCallback(() => adminApi.listWorkspaces(), []);
+  const wsData = usePolling(wsLoader, 60000);
+  const [selected, setSelected] = useState<string | null>(null);
+  const workspaceId = selected ?? wsData?.workspaces[0]?.id ?? null;
+
+  const loader = useCallback(
+    () => workspaceId ? adminApi.topConsumers(workspaceId) : Promise.reject(new Error("no workspace")),
+    [workspaceId]);
+  const data = usePolling(loader, 15000);
+
+  if (!wsData) return <div className="p-8 text-neutral-500"><AdminNav />Loading workspaces…</div>;
+  if (!workspaceId) return <div className="p-8 text-neutral-500"><AdminNav />No workspaces yet — create one under Team.</div>;
+  if (!data) return <div className="p-8 text-neutral-500"><AdminNav />Loading workspace…</div>;
 
   const mins = Math.ceil(data.window.resetInSeconds / 60);
+  const wsName = wsData.workspaces.find(w => w.id === workspaceId)?.name ?? "Workspace";
   return (
     <div className="mx-auto max-w-4xl p-8">
+      <AdminNav />
       <header className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-medium">Engineering workspace</h1>
-          <p className="text-xs text-neutral-400">Org admin · per-employee tracking</p>
+          <h1 className="text-lg font-medium">{wsName}</h1>
+          <p className="text-xs text-neutral-400">Org admin · per-employee tracking · window “{data.window.name}”</p>
         </div>
-        <button className="rounded-md border border-neutral-200 px-3 py-1.5 text-sm hover:bg-neutral-50 dark:border-neutral-700">
-          Manage quota
-        </button>
+        {wsData.workspaces.length > 1 && (
+          <label className="text-sm">
+            <span className="sr-only">Workspace</span>
+            <select value={workspaceId} onChange={e => setSelected(e.target.value)}
+              className="rounded-md border border-neutral-200 px-3 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-900">
+              {wsData.workspaces.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </select>
+          </label>
+        )}
       </header>
 
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">

@@ -4,11 +4,28 @@ namespace Gateway.Api.Providers;
 
 public sealed record ChatMessage(string Role, string Content);
 
+/// <summary>OrganizationId selects which stored provider credential authenticates the call.</summary>
 public sealed record ChatRequest(
+    Guid OrganizationId,
     string Model,
     IReadOnlyList<ChatMessage> Messages,
     int MaxTokens = 4096,
     bool Stream = true);
+
+/// <summary>No usable credential is stored for this organization/provider — an admin must connect one.</summary>
+public sealed class ProviderNotConfiguredException(string provider)
+    : Exception($"No active credential for provider '{provider}'.")
+{
+    public string Provider { get; } = provider;
+}
+
+/// <summary>The provider rejected the stored credential (401/403). Cache is already invalidated.</summary>
+public sealed class ProviderAuthException(string provider, int status)
+    : Exception($"Provider '{provider}' rejected the credential ({status}).")
+{
+    public string Provider { get; } = provider;
+    public int Status { get; } = status;
+}
 
 /// <summary>One streamed chunk. Usage is null until the final chunk.</summary>
 public sealed record ChatChunk(string? Delta, TokenUsage? Usage, bool Done);
@@ -47,6 +64,9 @@ public sealed class ProviderRouter
         _providers = providers.ToList();
         _log = log;
     }
+
+    /// <summary>True when some registered provider can serve this model.</summary>
+    public bool IsSupported(string model) => _providers.Any(p => p.Supports(model));
 
     public async IAsyncEnumerable<ChatChunk> StreamAsync(
         ChatRequest request,

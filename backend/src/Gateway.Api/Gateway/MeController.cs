@@ -15,12 +15,13 @@ namespace Gateway.Api.Gateway;
 public sealed class MeController : ControllerBase
 {
     private readonly IQuotaPolicyResolver _policies;
+    private readonly ITokenBalanceService _balances;
     private readonly IConnectionMultiplexer _redis;
     private readonly GatewayDbContext _db;
 
-    public MeController(IQuotaPolicyResolver policies, IConnectionMultiplexer redis, GatewayDbContext db)
+    public MeController(IQuotaPolicyResolver policies, ITokenBalanceService balances, IConnectionMultiplexer redis, GatewayDbContext db)
     {
-        _policies = policies; _redis = redis; _db = db;
+        _policies = policies; _balances = balances; _redis = redis; _db = db;
     }
 
     private (Guid userId, Guid workspaceId, Guid sessionId) Identity()
@@ -46,7 +47,27 @@ public sealed class MeController : ControllerBase
             var ttl = await db.KeyTimeToLiveAsync(key);
             windows.Add(new { name = w.Name, used, limit = w.TokenLimit, resetInSeconds = (int)(ttl?.TotalSeconds ?? w.WindowSeconds) });
         }
-        return Ok(new { windows });
+
+        // Credit a due allowance first, so the dashboard shows this month's balance
+        // rather than last month's remainder. Cheap when nothing is owed.
+        var principal = new QuotaPrincipal(userId, workspaceId);
+        await _balances.EnsureAllowanceAsync(policy.OrganizationId, principal, ct);
+
+        var balance = await _balances.GetAsync(policy.OrganizationId, principal, ct);
+        return Ok(new { windows, balance = new { enforced = balance is not null, remaining = balance } });
+    }
+
+    /// <summary>Prepaid balance only — cheap enough for an IDE extension to poll after each reply.</summary>
+    [HttpGet("balance")]
+    public async Task<IActionResult> Balance(CancellationToken ct)
+    {
+        var (userId, workspaceId, _) = Identity();
+        var principal = new QuotaPrincipal(userId, workspaceId);
+        var policy = await _policies.ResolveAsync(principal, ct);
+        await _balances.EnsureAllowanceAsync(policy.OrganizationId, principal, ct);
+
+        var balance = await _balances.GetAsync(policy.OrganizationId, principal, ct);
+        return Ok(new { enforced = balance is not null, remaining = balance });
     }
 
     [HttpGet("models")]

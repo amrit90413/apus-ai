@@ -39,7 +39,7 @@ function ProviderKeysSection() {
 
   const loader = useCallback(() => adminApi.listProviderKeys(), []);
   const polled = usePolling(loader, 10000);
-  const displayed = keys ?? polled;
+  const displayed = keys ?? polled?.keys ?? null;
 
   const handleAdd = async () => {
     if (!apiKey.trim()) return;
@@ -62,7 +62,7 @@ function ProviderKeysSection() {
     try {
       await adminApi.removeProviderKey(id);
       setKeys((prev) =>
-        (prev ?? polled ?? []).map((k) => (k.id === id ? { ...k, isActive: false } : k))
+        (prev ?? polled?.keys ?? []).map((k) => (k.id === id ? { ...k, isActive: false } : k))
       );
     } catch {
       setError(`Failed to remove key for ${p}.`);

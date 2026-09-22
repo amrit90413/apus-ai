@@ -23,9 +23,10 @@ public sealed class OtpService
 
     /// <summary>
     /// Generates an OTP, stores it in Redis, sends it via WhatsApp.
-    /// Returns a pendingToken the client must echo back with the OTP.
+    /// Returns the pendingToken the client must echo back with the OTP, or null
+    /// when the gateway could not deliver it.
     /// </summary>
-    public async Task<string> SendOtpAsync(User user, CancellationToken ct = default)
+    public async Task<string?> SendOtpAsync(User user, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(user.PhoneNumber))
             throw new InvalidOperationException("User has no phone number configured.");
@@ -40,9 +41,15 @@ public sealed class OtpService
             $"{user.Id}:{Hash(otp)}",
             Ttl);
 
-        await _whatsapp.SendOtpAsync(user.PhoneNumber, otp, ct);
-        _log.LogInformation("OTP sent to user {UserId} via WhatsApp", user.Id);
+        if (!await _whatsapp.SendOtpAsync(user.PhoneNumber, otp, ct))
+        {
+            // Nothing can complete this token, so don't leave it usable for 5 minutes.
+            await db.KeyDeleteAsync($"otp:{pendingToken}");
+            _log.LogError("OTP delivery failed for user {UserId}; login cannot proceed", user.Id);
+            return null;
+        }
 
+        _log.LogInformation("OTP sent to user {UserId} via WhatsApp", user.Id);
         return pendingToken;
     }
 

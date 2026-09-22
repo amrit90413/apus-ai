@@ -1,9 +1,18 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { authApi } from "@/lib/api";
+import { authApi, ApiError } from "@/lib/api";
 
 type Step = "credentials" | "otp";
+
+// Where to land after sign-in. Only same-origin paths are honoured so a crafted
+// link cannot bounce a user to another site.
+function nextPath(): string {
+  if (typeof window === "undefined") return "/";
+  const next = new URLSearchParams(window.location.search).get("next");
+  return next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -16,6 +25,16 @@ export default function LoginPage() {
   const [otp, setOtp] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Only offer self-service signup when the gateway has it switched on.
+  const [signupEnabled, setSignupEnabled] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    authApi.registerAvailability()
+      .then(a => { if (alive) setSignupEnabled(a.enabled); })
+      .catch(() => { /* availability is informational; the form works without it */ });
+    return () => { alive = false; };
+  }, []);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,11 +48,13 @@ export default function LoginPage() {
         setStep("otp");
       } else {
         // Regular user — JWT returned directly
-        authApi.saveToken(result.accessToken, result.refreshToken);
-        router.push("/");
+        authApi.saveToken(result);
+        router.push(nextPath());
       }
-    } catch {
-      setError("Invalid email or password.");
+    } catch (err) {
+      // 401 is the only case where the generic text is right; anything else (OTP
+      // bot down, rate limit, 5xx) carries a server message worth showing.
+      setError(err instanceof ApiError && err.status !== 401 ? err.message : "Invalid email or password.");
     } finally {
       setLoading(false);
     }
@@ -45,10 +66,10 @@ export default function LoginPage() {
     setError(null);
     try {
       const result = await authApi.verifyOtp(pendingToken, otp);
-      authApi.saveToken(result.accessToken, result.refreshToken);
-      router.push("/");
-    } catch {
-      setError("Incorrect or expired OTP. Try again.");
+      authApi.saveToken(result);
+      router.push(nextPath());
+    } catch (err) {
+      setError(err instanceof ApiError && err.status !== 401 ? err.message : "Incorrect or expired OTP. Try again.");
       setOtp("");
     } finally {
       setLoading(false);
@@ -95,6 +116,11 @@ export default function LoginPage() {
             >
               {loading ? "Signing in…" : "Sign in"}
             </button>
+            {signupEnabled && (
+              <p className="text-center text-xs text-neutral-400">
+                New here? <Link href="/register" className="hover:underline">Create an organization</Link>
+              </p>
+            )}
           </form>
         ) : (
           <form onSubmit={handleVerifyOtp} className="space-y-4">
