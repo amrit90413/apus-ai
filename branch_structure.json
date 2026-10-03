@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "claude/affectionate-ramanujan-dw8wda",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "claude/affectionate-ramanujan-dw8wda": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "claude/affectionate-ramanujan-dw8wda",
+    "origin"
+  ]
+}
