@@ -12,8 +12,8 @@ dist/
 infra/k8s/secrets.yaml
 # OS
 .DS_Store
+tsconfig.tsbuildinfo
+*.tsbuildinfo
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
-tsconfig.tsbuildinfo
-*.tsbuildinfo
